@@ -2264,10 +2264,13 @@ body.hide-thinking .thinking-block { display: none !important; }
   font-size: 16px;
   font-family: inherit;
   outline: none;
-  resize: none;
+  min-height: 44px;
   max-height: 160px;
   line-height: 1.45;
   overflow-y: auto;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  -webkit-user-modify: read-write-plaintext-only;
   backdrop-filter: blur(var(--blur));
   -webkit-backdrop-filter: blur(var(--blur));
   transition: all var(--duration) var(--ease);
@@ -2308,8 +2311,12 @@ body.hide-thinking .thinking-block { display: none !important; }
   animation: pulse 1.5s infinite;
 }
 
-#message-input:disabled { opacity: 0.35; cursor: not-allowed; }
-#message-input::placeholder { color: var(--text-dim); }
+#message-input[data-disabled="true"] { opacity: 0.35; cursor: not-allowed; pointer-events: none; }
+#message-input:empty::before {
+  content: attr(data-placeholder);
+  color: var(--text-dim);
+  pointer-events: none;
+}
 
 .input-actions { display: flex; gap: 4px; align-self: center; }
 

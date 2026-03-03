@@ -450,17 +450,24 @@ chatForm.addEventListener('submit', (e) => {
 });
 
 messageInput.addEventListener('keydown', (e) => {
-  // Enter sends, Shift+Enter inserts newline
-  if (e.key === 'Enter' && !e.shiftKey) {
+  // Desktop: Enter sends, Shift+Enter inserts newline
+  // Mobile: Enter always inserts newline (send via button)
+  if (e.key === 'Enter' && !e.shiftKey && !isMobile()) {
     e.preventDefault();
     sendMessage();
   }
 });
 
-// Auto-resize textarea
+// Auto-resize contenteditable
 messageInput.addEventListener('input', () => {
-  messageInput.style.height = 'auto';
-  messageInput.style.height = Math.min(messageInput.scrollHeight, 200) + 'px';
+  // Constrain max height
+  if (messageInput.scrollHeight > 200) {
+    messageInput.style.maxHeight = '200px';
+    messageInput.style.overflowY = 'auto';
+  } else {
+    messageInput.style.maxHeight = '';
+    messageInput.style.overflowY = '';
+  }
 });
 
 // ═══════════════════════════════════════
@@ -547,14 +554,22 @@ messageInput.addEventListener('drop', (e) => {
   addImageFiles(e.dataTransfer.files);
 });
 
-// Paste images
+// Paste: handle images + force plain text for contenteditable
 messageInput.addEventListener('paste', (e) => {
   const files = [];
   for (const item of e.clipboardData.items) {
     if (!item.type.startsWith('image/')) continue;
     files.push(item.getAsFile());
   }
-  if (files.length) addImageFiles(files);
+  if (files.length) {
+    e.preventDefault();
+    addImageFiles(files);
+    return;
+  }
+  // Force plain text paste (no HTML formatting)
+  e.preventDefault();
+  const text = e.clipboardData.getData('text/plain');
+  if (text) document.execCommand('insertText', false, text);
 });
 
 function renderImagePreviews() {
@@ -586,11 +601,12 @@ function renderImagePreviews() {
 let messageQueue = [];
 
 function sendMessage() {
-  const message = messageInput.value.trim();
+  const message = (messageInput.innerText || messageInput.textContent || '').trim();
   if (!message) return;
 
-  messageInput.value = '';
-  messageInput.style.height = 'auto';
+  messageInput.textContent = '';
+  messageInput.style.maxHeight = '';
+  messageInput.style.overflowY = '';
 
   const cmd = {
     type: 'prompt',
@@ -1216,12 +1232,14 @@ function updateMirrorInputState() {
 
   const inputArea = document.querySelector('.input-area');
   if (viewingActiveSession) {
-    messageInput.disabled = false;
-    messageInput.placeholder = 'Message...';
+    messageInput.contentEditable = 'true';
+    messageInput.dataset.disabled = 'false';
+    messageInput.dataset.placeholder = 'Message...';
     inputArea?.classList.remove('mirror-readonly');
   } else {
-    messageInput.disabled = true;
-    messageInput.placeholder = 'Viewing historical session (read-only)';
+    messageInput.contentEditable = 'false';
+    messageInput.dataset.disabled = 'true';
+    messageInput.dataset.placeholder = 'Viewing historical session (read-only)';
     inputArea?.classList.add('mirror-readonly');
   }
 }
@@ -1437,7 +1455,8 @@ function updateUI() {
     statusText.textContent = 'Connected';
   }
 
-  messageInput.disabled = false;
+  messageInput.contentEditable = 'true';
+  messageInput.dataset.disabled = 'false';
   sendBtn.disabled = false;
 
   if (isStreaming) {
@@ -1690,7 +1709,7 @@ if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
       }
     }
     // Show live transcription in the input
-    messageInput.value = finalTranscript + interimTranscript;
+    messageInput.textContent = finalTranscript + interimTranscript;
     messageInput.dispatchEvent(new Event('input'));
   });
 
@@ -1715,7 +1734,7 @@ if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
   });
 
   function startRecording() {
-    finalTranscript = messageInput.value; // Append to existing text
+    finalTranscript = messageInput.textContent || ''; // Append to existing text
     interimTranscript = '';
     isRecording = true;
     micBtn.classList.add('recording');
@@ -1730,7 +1749,7 @@ if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
     micBtn.title = 'Voice input';
     try { recognition.stop(); } catch {}
     // Commit final transcript
-    messageInput.value = finalTranscript;
+    messageInput.textContent = finalTranscript;
     messageInput.dispatchEvent(new Event('input'));
     messageInput.focus();
   }
