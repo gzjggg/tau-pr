@@ -35,7 +35,7 @@ export class ToolCardRenderer {
         <div class="tool-output-wrapper">
           <div class="tool-output-header">
             <span>Output</span>
-            <button class="copy-btn" onclick="event.stopPropagation(); this.closest('.tool-card').querySelector('.tool-output') && navigator.clipboard.writeText(this.closest('.tool-card').querySelector('.tool-output').textContent).then(() => { this.textContent = 'Copied!'; this.classList.add('copied'); setTimeout(() => { this.textContent = 'Copy'; this.classList.remove('copied'); }, 2000); })">Copy</button>
+            <button class="copy-btn" onclick="event.stopPropagation(); var t=this.closest('.tool-card').querySelector('.tool-output'); if(!t)return; var s=t.textContent,b=this; var fn=navigator.clipboard?navigator.clipboard.writeText(s):new Promise(function(r){var a=document.createElement('textarea');a.value=s;a.style.cssText='position:fixed;left:-9999px';document.body.appendChild(a);a.select();document.execCommand('copy');document.body.removeChild(a);r()}); fn.then(function(){b.textContent='Copied!';b.classList.add('copied');setTimeout(function(){b.textContent='Copy';b.classList.remove('copied')},2000)})">Copy</button>
           </div>
           <div class="tool-output"></div>
         </div>

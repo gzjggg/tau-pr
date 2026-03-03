@@ -223,11 +223,22 @@ export class MessageRenderer {
     btn.addEventListener('click', () => {
       const content = messageEl.querySelector('.message-content');
       if (!content) return;
-      navigator.clipboard.writeText(content.textContent).then(() => {
-        btn.innerHTML = '✓';
+      const text = content.textContent;
+      // Fallback for non-HTTPS (LAN access)
+      const copyText = (t) => {
+        if (navigator.clipboard) return navigator.clipboard.writeText(t);
+        const ta = document.createElement('textarea');
+        ta.value = t;
+        ta.style.cssText = 'position:fixed;left:-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        return Promise.resolve();
+      };
+      copyText(text).then(() => {
         btn.classList.add('copied');
         setTimeout(() => {
-          btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
           btn.classList.remove('copied');
         }, 1500);
       });

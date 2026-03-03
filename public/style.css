@@ -2754,6 +2754,15 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
   color: var(--success);
 }
 
+.message-copy-btn.copied svg {
+  display: none;
+}
+
+.message-copy-btn.copied::after {
+  content: '✓';
+  font-size: 12px;
+}
+
 /* Error / system messages */
 .error-message {
   background: rgba(248, 113, 113, 0.06);
@@ -2954,36 +2963,13 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
     opacity: 0.4 !important;
   }
 
-  /* Context bar above input on mobile */
+  /* Hide context bar on mobile */
   .mobile-context-toggle {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 100%;
-    padding: 2px 0;
-    background: none;
-    border: none;
-    color: var(--text-dim);
-    cursor: pointer;
-    transition: transform 0.2s var(--ease);
-  }
-
-  .mobile-context-toggle.flipped svg {
-    transform: rotate(180deg);
+    display: none !important;
   }
 
   .mobile-model-bar {
-    display: flex !important;
-    overflow: hidden;
-    transition: max-height 0.2s var(--ease), opacity 0.2s var(--ease), padding 0.2s var(--ease);
-    max-height: 40px;
-    opacity: 1;
-  }
-
-  .mobile-model-bar.collapsed {
-    max-height: 0;
-    opacity: 0;
-    padding: 0 4px;
+    display: none !important;
   }
 
   /* Slim down header */
