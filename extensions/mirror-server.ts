@@ -22,13 +22,35 @@ const PORT = parseInt(process.env.TAU_MIRROR_PORT || "3001");
 const STATIC_DIR = process.env.TAU_STATIC_DIR || findPublicDir();
 
 function findPublicDir(): string {
-    // 1. Check bundled "public" folder inside extension dir
-    const bundledPublic = path.resolve(__dirname, "public");
-    if (fs.existsSync(path.join(bundledPublic, "index.html"))) return bundledPublic;
-    // 2. Check sibling "public" folder (when running from pi-web-ui repo)
-    const siblingPublic = path.resolve(__dirname, "../public");
-    if (fs.existsSync(path.join(siblingPublic, "index.html"))) return siblingPublic;
-    // 3. Fall back to CWD/public
+    const candidates: string[] = [];
+    const seen = new Set<string>();
+    const addCandidate = (dir: string) => {
+      const normalized = path.resolve(dir);
+      if (seen.has(normalized)) return;
+      seen.add(normalized);
+      candidates.push(normalized);
+    };
+
+    // 1) Common extension-relative paths
+    addCandidate(path.resolve(__dirname, "public"));
+    addCandidate(path.resolve(__dirname, "../public"));
+
+    // 2) Installed package path (for npm-installed extension execution)
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const pkgPath = require.resolve("tau-mirror/package.json");
+      addCandidate(path.join(path.dirname(pkgPath), "public"));
+    } catch {}
+
+    // 3) Development fallback from current working directory
+    addCandidate(path.resolve(process.cwd(), "public"));
+    addCandidate(path.resolve(process.cwd(), "node_modules/tau-mirror/public"));
+
+    for (const candidate of candidates) {
+      if (fs.existsSync(path.join(candidate, "index.html"))) return candidate;
+    }
+
+    // Keep previous fallback behavior
     return path.resolve(process.cwd(), "public");
 }
 const SESSIONS_DIR = path.join(process.env.HOME || "~", ".pi/agent/sessions");
@@ -92,6 +114,7 @@ const MIME_TYPES: Record<string, string> = {
 export default function (pi: ExtensionAPI) {
   let server: http.Server | null = null;
   let wss: WebSocketServer | null = null;
+  let heartbeatTimer: NodeJS.Timeout | null = null;
   const clients = new Set<WebSocket>();
 
   // Store latest context reference for use in command handlers
@@ -1173,6 +1196,11 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     wss.on("connection", (ws) => {
       console.log("[Mirror] Browser client connected");
       clients.add(ws);
+      (ws as any).isAlive = true;
+
+      ws.on("pong", () => {
+        (ws as any).isAlive = true;
+      });
 
       // Send initial state
       sendTo(ws, { type: "state", isStreaming: false, mode: "mirror" });
@@ -1203,6 +1231,25 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         clients.delete(ws);
       });
     });
+
+    // Heartbeat keeps mobile/Tailscale sessions alive and removes stale clients.
+    heartbeatTimer = setInterval(() => {
+      for (const client of clients) {
+        if (client.readyState !== WebSocket.OPEN) {
+          clients.delete(client);
+          continue;
+        }
+
+        if (!(client as any).isAlive) {
+          try { client.terminate(); } catch {}
+          clients.delete(client);
+          continue;
+        }
+
+        (client as any).isAlive = false;
+        try { client.ping(); } catch {}
+      }
+    }, 20000);
 
     const tryListen = (port: number, maxAttempts = 10) => {
       server!.listen(port, "0.0.0.0", () => {
@@ -1280,6 +1327,10 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   // Cleanup on shutdown
   // ═══════════════════════════════════════
   pi.on("session_shutdown", async () => {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
     if (wss) {
       for (const client of clients) {
         client.close();
