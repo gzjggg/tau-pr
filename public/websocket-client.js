@@ -8,16 +8,27 @@ export class WebSocketClient extends EventTarget {
     this.url = url;
     this.ws = null;
     this.reconnectAttempts = 0;
-    this.maxReconnectAttempts = 5;
+    this.maxReconnectAttempts = Infinity;
     this.reconnectDelay = 1000;
+    this.maxReconnectDelay = 10000;
     this.isIntentionallyClosed = false;
+    this.reconnectTimer = null;
+    this.connectionState = 'idle';
   }
 
   connect() {
+    if (this.connectionState === 'connecting') return;
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
+    if (this.ws && this.ws.readyState === WebSocket.CONNECTING) return;
+
     this.isIntentionallyClosed = false;
-    // Close any stale socket before reconnecting
-    if (this.ws) {
-      try { this.ws.close(); } catch (e) {}
+    this.connectionState = 'connecting';
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    // Close only fully stale sockets before reconnecting
+    if (this.ws && (this.ws.readyState === WebSocket.CLOSING || this.ws.readyState === WebSocket.CLOSED)) {
       this.ws = null;
     }
     this.ws = new WebSocket(this.url);
@@ -25,6 +36,7 @@ export class WebSocketClient extends EventTarget {
     this.ws.onopen = () => {
       console.log('[WS] Connected');
       this.reconnectAttempts = 0;
+      this.connectionState = 'open';
       this.dispatchEvent(new CustomEvent('connected'));
     };
 
@@ -42,8 +54,9 @@ export class WebSocketClient extends EventTarget {
       this.dispatchEvent(new CustomEvent('error', { detail: error }));
     };
 
-    this.ws.onclose = () => {
-      console.log('[WS] Disconnected');
+    this.ws.onclose = (event) => {
+      console.log(`[WS] Disconnected (code=${event.code}, reason=${event.reason || 'n/a'})`);
+      this.connectionState = 'closed';
       this.dispatchEvent(new CustomEvent('disconnected'));
 
       if (!this.isIntentionallyClosed) {
@@ -54,6 +67,11 @@ export class WebSocketClient extends EventTarget {
 
   disconnect() {
     this.isIntentionallyClosed = true;
+    this.connectionState = 'closed';
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.ws) {
       this.ws.close();
     }
@@ -62,7 +80,15 @@ export class WebSocketClient extends EventTarget {
   // Force reconnect — resets attempt counter and connects fresh
   forceReconnect() {
     this.reconnectAttempts = 0;
-    this.isIntentionallyClosed = true; // suppress 'disconnected' event from stale close
+    this.isIntentionallyClosed = false;
+    this.connectionState = 'closed';
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      try { this.ws.close(1000, 'force reconnect'); } catch (e) {}
+    }
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.connect();
   }
 
@@ -74,11 +100,12 @@ export class WebSocketClient extends EventTarget {
     }
 
     this.reconnectAttempts++;
-    const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
+    const delay = Math.min(this.maxReconnectDelay, this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1));
     
     console.log(`[WS] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
     
-    setTimeout(() => {
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
       this.connect();
     }, delay);
   }
