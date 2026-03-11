@@ -28,15 +28,14 @@ export class ToolCardRenderer {
           <span class="tool-name">${this.escapeHtml(toolName)}</span>
           ${argsPreview ? `<span class="tool-args-preview">${this.escapeHtml(argsPreview)}</span>` : ''}
         </div>
-        <div class="tool-status ${status}">${status}</div>
+        <div class="tool-header-right">
+          <button class="tool-action-btn copy-output-btn" title="Copy output" onclick="event.stopPropagation(); var t=this.closest('.tool-card').querySelector('.tool-output'); if(!t||!t.textContent.trim())return; var s=t.textContent,b=this; (navigator.clipboard?navigator.clipboard.writeText(s):new Promise(function(r){var a=document.createElement('textarea');a.value=s;a.style.cssText='position:fixed;left:-9999px';document.body.appendChild(a);a.select();document.execCommand('copy');document.body.removeChild(a);r()})).then(function(){b.classList.add('copied');setTimeout(function(){b.classList.remove('copied')},1500)})"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg></button>
+          <div class="tool-status ${status}">${status}</div>
+        </div>
       </div>
       <div class="tool-card-body${isExpanded ? ' expanded' : ''}">
         ${!isEdit && argsJson ? `<div class="tool-args">${this.escapeHtml(argsJson)}</div>` : ''}
         <div class="tool-output-wrapper">
-          <div class="tool-output-header">
-            <span>Output</span>
-            <button class="copy-btn" onclick="event.stopPropagation(); var t=this.closest('.tool-card').querySelector('.tool-output'); if(!t)return; var s=t.textContent,b=this; var fn=navigator.clipboard?navigator.clipboard.writeText(s):new Promise(function(r){var a=document.createElement('textarea');a.value=s;a.style.cssText='position:fixed;left:-9999px';document.body.appendChild(a);a.select();document.execCommand('copy');document.body.removeChild(a);r()}); fn.then(function(){b.textContent='Copied!';b.classList.add('copied');setTimeout(function(){b.textContent='Copy';b.classList.remove('copied')},2000)})">Copy</button>
-          </div>
           <div class="tool-output"></div>
         </div>
       </div>
@@ -151,10 +150,35 @@ export class ToolCardRenderer {
 
     header.appendChild(headerLeft);
 
+    // Right side: copy button + status
+    const headerRight = document.createElement('div');
+    headerRight.className = 'tool-header-right';
+
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'tool-action-btn copy-output-btn';
+    copyBtn.title = 'Copy output';
+    copyBtn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
+    copyBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const output = card.querySelector('.tool-output');
+      if (!output || !output.textContent.trim()) return;
+      const text = output.textContent;
+      (navigator.clipboard ? navigator.clipboard.writeText(text) : new Promise((r) => {
+        const ta = document.createElement('textarea'); ta.value = text; ta.style.cssText = 'position:fixed;left:-9999px';
+        document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); r();
+      })).then(() => {
+        copyBtn.classList.add('copied');
+        setTimeout(() => copyBtn.classList.remove('copied'), 1500);
+      });
+    });
+    headerRight.appendChild(copyBtn);
+
     const status = document.createElement('div');
     status.className = 'tool-status complete';
     status.textContent = 'complete';
-    header.appendChild(status);
+    headerRight.appendChild(status);
+
+    header.appendChild(headerRight);
 
     // Toggle expand on click
     header.addEventListener('click', () => {
@@ -302,6 +326,20 @@ export class ToolCardRenderer {
         });
       }
     }
+  }
+
+  expandAll() {
+    this.toolCards.forEach(card => {
+      card.querySelector('.tool-card-body')?.classList.add('expanded');
+      card.querySelector('.tool-card-chevron')?.classList.add('expanded');
+    });
+  }
+
+  collapseAll() {
+    this.toolCards.forEach(card => {
+      card.querySelector('.tool-card-body')?.classList.remove('expanded');
+      card.querySelector('.tool-card-chevron')?.classList.remove('expanded');
+    });
   }
 
   clear() {
