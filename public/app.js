@@ -174,6 +174,7 @@ wsClient.addEventListener('connected', () => {
   updateConnectionStatus('connected');
   // Fetch model context window size for token % display
   setTimeout(fetchContextWindow, 1000);
+  setTimeout(prefetchAutocompleteCaches, 500);
 });
 
 wsClient.addEventListener('disconnected', () => {
@@ -461,6 +462,272 @@ messageInput.addEventListener('keydown', (e) => {
 messageInput.addEventListener('input', () => {
   messageInput.style.height = 'auto';
   messageInput.style.height = Math.min(messageInput.scrollHeight, 200) + 'px';
+  handleAutocompleteInput();
+});
+
+// ═══════════════════════════════════════
+// Autocomplete Popover (@files, /commands)
+// ═══════════════════════════════════════
+
+const autocompletePopover = document.getElementById('autocomplete-popover');
+const autocompleteList = document.getElementById('autocomplete-list');
+let autocompleteMode = null; // null | '@' | '/'
+let autocompleteItems = [];
+let autocompleteSelectedIndex = 0;
+let autocompleteStartPos = -1; // cursor position where the trigger char was typed
+let fileCache = null;
+let fileCacheTime = 0;
+let commandCache = null;
+let commandCacheTime = 0;
+const CACHE_TTL = 30000; // 30 seconds
+
+// Pre-fetch caches on load so popovers appear instantly
+function prefetchAutocompleteCaches() {
+  fetch('/api/rpc', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'list_files', prefix: '' }),
+  }).then(r => r.json()).then(data => {
+    if (data.success) { fileCache = data.data.files; fileCacheTime = Date.now(); }
+  }).catch(() => {});
+
+  fetch('/api/rpc', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'get_commands' }),
+  }).then(r => r.json()).then(data => {
+    if (data.success) { commandCache = data.data; commandCacheTime = Date.now(); }
+  }).catch(() => {});
+}
+prefetchAutocompleteCaches();
+
+function handleAutocompleteInput() {
+  const val = messageInput.value;
+  const cursor = messageInput.selectionStart;
+
+
+  // Find the trigger: look backwards from cursor for @ or /
+  // Only trigger at start of word (preceded by whitespace or start of string)
+  let triggerPos = -1;
+  let triggerChar = null;
+
+  for (let i = cursor - 1; i >= 0; i--) {
+    const ch = val[i];
+    if (ch === ' ' || ch === '\n') break; // hit whitespace, stop
+    if ((ch === '@' || ch === '/') && (i === 0 || val[i - 1] === ' ' || val[i - 1] === '\n')) {
+      triggerPos = i;
+      triggerChar = ch;
+      break;
+    }
+  }
+
+  if (triggerPos === -1 || !triggerChar) {
+    closeAutocomplete();
+    return;
+  }
+
+  const query = val.slice(triggerPos + 1, cursor);
+  autocompleteStartPos = triggerPos;
+  autocompleteMode = triggerChar;
+
+
+  if (triggerChar === '@') {
+    fetchFiles(query);
+  } else if (triggerChar === '/') {
+    fetchCommands(query);
+  }
+}
+
+async function fetchFiles(query) {
+  const now = Date.now();
+  if (!fileCache || now - fileCacheTime > CACHE_TTL) {
+    try {
+      const resp = await fetch('/api/rpc', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'list_files', prefix: '' }),
+      });
+      const data = await resp.json();
+
+      if (data.success) {
+        fileCache = data.data.files;
+        fileCacheTime = now;
+      }
+    } catch (e) { console.error('[autocomplete] list_files error:', e); return; }
+  }
+
+  let items = fileCache || [];
+  if (query) {
+    const lower = query.toLowerCase();
+    items = items.filter(f => f.toLowerCase().includes(lower));
+    // Sort: basename matches first, then path matches
+    items.sort((a, b) => {
+      const aBase = a.split('/').pop().toLowerCase();
+      const bBase = b.split('/').pop().toLowerCase();
+      const aMatch = aBase.includes(lower);
+      const bMatch = bBase.includes(lower);
+      if (aMatch && !bMatch) return -1;
+      if (!aMatch && bMatch) return 1;
+      return a.localeCompare(b);
+    });
+  }
+
+  showAutocomplete(items.slice(0, 20).map(f => ({
+    icon: getFileIcon(f),
+    label: f,
+    desc: '',
+    value: f,
+  })));
+}
+
+function getFileIcon(filename) {
+  const ext = filename.split('.').pop()?.toLowerCase();
+  const icons = {
+    ts: '📘', tsx: '📘', js: '📒', jsx: '📒', json: '📋',
+    md: '📝', css: '🎨', html: '🌐', py: '🐍', rs: '🦀',
+    swift: '🍎', go: '🔵', sh: '⚙️', yaml: '📄', yml: '📄',
+    toml: '📄', svg: '🖼️', png: '🖼️', jpg: '🖼️',
+  };
+  return icons[ext] || '📄';
+}
+
+async function fetchCommands(query) {
+  const now = Date.now();
+  if (!commandCache || now - commandCacheTime > CACHE_TTL) {
+    try {
+      const resp = await fetch('/api/rpc', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'get_commands' }),
+      });
+      const data = await resp.json();
+
+      if (data.success) {
+        commandCache = data.data;
+        commandCacheTime = now;
+      }
+    } catch (e) { console.error('[autocomplete] get_commands error:', e); return; }
+  }
+
+  let items = commandCache || [];
+  if (query) {
+    const lower = query.toLowerCase();
+    items = items.filter(c => c.name.toLowerCase().includes(lower) || (c.description || '').toLowerCase().includes(lower));
+  }
+
+  const sourceIcons = { extension: '🧩', prompt: '📋', skill: '🎯' };
+
+  showAutocomplete(items.slice(0, 20).map(c => ({
+    icon: sourceIcons[c.source] || '⚡',
+    label: c.name,
+    desc: c.description || c.source || '',
+    value: c.name,
+  })));
+}
+
+function showAutocomplete(items) {
+  if (items.length === 0) {
+    closeAutocomplete();
+    return;
+  }
+
+  autocompleteItems = items;
+  autocompleteSelectedIndex = 0;
+  renderAutocompleteItems();
+  autocompletePopover.classList.remove('hidden');
+}
+
+function renderAutocompleteItems() {
+  autocompleteList.innerHTML = '';
+  autocompleteItems.forEach((item, i) => {
+    const el = document.createElement('div');
+    el.className = 'autocomplete-item' + (i === autocompleteSelectedIndex ? ' selected' : '');
+    el.innerHTML = `
+      <span class="autocomplete-item-icon">${item.icon}</span>
+      <span class="autocomplete-item-label">${escapeHtml(item.label)}</span>
+      ${item.desc ? `<span class="autocomplete-item-desc">${escapeHtml(item.desc)}</span>` : ''}
+    `;
+    el.addEventListener('click', () => acceptAutocomplete(i));
+    el.addEventListener('mouseenter', () => {
+      autocompleteSelectedIndex = i;
+      renderAutocompleteItems();
+    });
+    autocompleteList.appendChild(el);
+  });
+
+  // Scroll selected into view
+  const selected = autocompleteList.children[autocompleteSelectedIndex];
+  if (selected) selected.scrollIntoView({ block: 'nearest' });
+}
+
+function acceptAutocomplete(index) {
+  const item = autocompleteItems[index];
+  if (!item) return;
+
+  const val = messageInput.value;
+  const before = val.slice(0, autocompleteStartPos);
+  const after = val.slice(messageInput.selectionStart);
+
+  if (autocompleteMode === '@') {
+    messageInput.value = before + '@' + item.value + ' ' + after;
+  } else if (autocompleteMode === '/') {
+    messageInput.value = before + '/' + item.value + ' ' + after;
+  }
+
+  // Set cursor position after inserted text
+  const newPos = before.length + 1 + item.value.length + 1;
+  messageInput.selectionStart = messageInput.selectionEnd = newPos;
+
+  closeAutocomplete();
+  messageInput.focus();
+
+  // Trigger resize
+  messageInput.style.height = 'auto';
+  messageInput.style.height = Math.min(messageInput.scrollHeight, 200) + 'px';
+}
+
+function closeAutocomplete() {
+  autocompleteMode = null;
+  autocompleteItems = [];
+  autocompleteStartPos = -1;
+  autocompletePopover.classList.add('hidden');
+}
+
+// Intercept keyboard in textarea for autocomplete navigation
+messageInput.addEventListener('keydown', (e) => {
+  if (autocompleteMode) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      autocompleteSelectedIndex = (autocompleteSelectedIndex + 1) % autocompleteItems.length;
+      renderAutocompleteItems();
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      autocompleteSelectedIndex = (autocompleteSelectedIndex - 1 + autocompleteItems.length) % autocompleteItems.length;
+      renderAutocompleteItems();
+      return;
+    }
+    if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+      if (autocompleteItems.length > 0) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        acceptAutocomplete(autocompleteSelectedIndex);
+        return;
+      }
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeAutocomplete();
+      return;
+    }
+  }
+}, true); // Use capture phase to intercept before the send handler
+
+// Close autocomplete on blur
+messageInput.addEventListener('blur', () => {
+  // Delay to allow click on popover items
+  setTimeout(() => closeAutocomplete(), 200);
 });
 
 // ═══════════════════════════════════════

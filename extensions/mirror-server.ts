@@ -604,6 +604,66 @@ export default function (pi: ExtensionAPI) {
           break;
         }
 
+        // ─── Commands & Files ───
+        case "get_commands": {
+          try {
+            const cmds = pi.getCommands();
+            sendTo(ws, success("get_commands", cmds));
+          } catch (e: any) {
+            sendTo(ws, error("get_commands", e.message));
+          }
+          break;
+        }
+
+        case "list_files": {
+          try {
+            const cwd = ctx?.cwd || process.cwd();
+            const prefix = command.prefix || "";
+            const { execSync } = require("node:child_process");
+
+            // Use find to list files, respecting .gitignore via git ls-files when possible
+            let files: string[] = [];
+            try {
+              // Try git ls-files first (respects .gitignore)
+              const gitOutput = execSync(
+                `git ls-files --cached --others --exclude-standard 2>/dev/null | head -200`,
+                { cwd, encoding: "utf8", timeout: 3000 }
+              );
+              files = gitOutput.trim().split("\n").filter(Boolean);
+            } catch {
+              // Fallback: basic find, skip node_modules/.git
+              const findOutput = execSync(
+                `find . -maxdepth 4 -type f -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/dist/*' 2>/dev/null | head -200`,
+                { cwd, encoding: "utf8", timeout: 3000 }
+              );
+              files = findOutput.trim().split("\n").filter(Boolean).map(f => f.replace(/^\.\//, ""));
+            }
+
+            // Filter by prefix if provided
+            if (prefix) {
+              const lower = prefix.toLowerCase();
+              files = files.filter(f => f.toLowerCase().includes(lower));
+            }
+
+            // Sort: exact prefix matches first, then alphabetical
+            files.sort((a, b) => {
+              if (prefix) {
+                const lower = prefix.toLowerCase();
+                const aStarts = a.toLowerCase().startsWith(lower);
+                const bStarts = b.toLowerCase().startsWith(lower);
+                if (aStarts && !bStarts) return -1;
+                if (!aStarts && bStarts) return 1;
+              }
+              return a.localeCompare(b);
+            });
+
+            sendTo(ws, success("list_files", { files: files.slice(0, 50), cwd }));
+          } catch (e: any) {
+            sendTo(ws, error("list_files", e.message));
+          }
+          break;
+        }
+
         // ─── Sync ───
         case "mirror_sync_request": {
           if (ctx) {
