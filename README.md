@@ -28,7 +28,7 @@ pi install npm:tau-mirror
 Or from git:
 
 ```bash
-pi install git:github.com/mattkennelly/tau
+pi install git:github.com/deflating/tau
 ```
 
 ## Usage
@@ -92,6 +92,24 @@ Environment variables (set before starting Pi):
 |----------|---------|-------------|
 | `TAU_MIRROR_PORT` | `3001` | Server port |
 | `TAU_STATIC_DIR` | *(bundled)* | Override static files path |
+| `TAU_DISABLED` | `0` | Set to `1` to disable Tau (it stays installed but won't start the server) |
+
+### Start / Stop
+
+Control Tau at runtime without uninstalling:
+
+```
+/tau-stop     Stop the mirror server
+/tau-start    Start it again
+```
+
+To prevent Tau from auto-starting (e.g. in multi-session or dev container workflows):
+
+```bash
+TAU_DISABLED=1 pi
+```
+
+You can still start it manually with `/tau-start` in that session.
 
 ## How it works
 
@@ -113,7 +131,7 @@ There's no separate server to run. The extension auto-loads when Pi starts and s
 Clone and point the extension at the local static files:
 
 ```bash
-git clone https://github.com/mattkennelly/tau.git
+git clone https://github.com/deflating/tau.git
 cd tau
 TAU_STATIC_DIR=$(pwd)/public pi
 ```

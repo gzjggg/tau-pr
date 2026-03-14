@@ -1710,6 +1710,15 @@ body {
   font-weight: 500;
 }
 
+/* User bubble markdown */
+.message.user .message-content blockquote {
+  border-left: 2px solid currentColor;
+  padding-left: 10px;
+  margin: 4px 0;
+  opacity: 0.75;
+  font-style: italic;
+}
+
 /* Assistant — clean, no container */
 .message.assistant .message-content {
   background: none;
@@ -1752,6 +1761,95 @@ body {
   padding-left: 12px;
   margin: 8px 0;
   color: var(--text-secondary);
+  font-style: italic;
+}
+
+/* Tables */
+.message.assistant .message-content .table-wrapper {
+  overflow-x: auto;
+  margin: 8px 0;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+}
+
+.message.assistant .message-content table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.message.assistant .message-content th {
+  background: var(--bg-glass-strong);
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-secondary);
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-hover);
+  white-space: nowrap;
+}
+
+.message.assistant .message-content td {
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-primary);
+}
+
+.message.assistant .message-content tr:last-child td {
+  border-bottom: none;
+}
+
+.message.assistant .message-content tr:hover td {
+  background: var(--bg-glass);
+}
+
+/* Task lists */
+.message.assistant .message-content .task-list {
+  list-style: none;
+  padding-left: 0;
+}
+
+.message.assistant .message-content .task-list-item {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.message.assistant .message-content .task-list-item input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--border-bright);
+  border-radius: var(--radius-xs);
+  background: var(--bg-glass);
+  flex-shrink: 0;
+  position: relative;
+  top: 2px;
+}
+
+.message.assistant .message-content .task-list-item input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.message.assistant .message-content .task-list-item input[type="checkbox"]:checked::after {
+  content: '✓';
+  color: white;
+  font-size: 10px;
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+}
+
+/* Inline images */
+.message.assistant .message-content .inline-image {
+  max-width: 100%;
+  border-radius: var(--radius-md);
+  margin: 6px 0;
+  border: 1px solid var(--border);
 }
 
 /* ═══════════════════════════════════════════════════════

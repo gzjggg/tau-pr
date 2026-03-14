@@ -18,6 +18,7 @@ import * as path from "node:path";
 import QRCode from "qrcode";
 
 const PORT = parseInt(process.env.TAU_MIRROR_PORT || "3001");
+const TAU_AUTO_START = !(process.env.TAU_DISABLED === "1" || process.env.TAU_DISABLED === "true");
 // @ts-ignore — __dirname is provided by jiti at runtime
 const STATIC_DIR = process.env.TAU_STATIC_DIR || findPublicDir();
 
@@ -97,6 +98,47 @@ function getRunningInstances(): Array<{ port: number; pid: number; sessionFile: 
   return instances;
 }
 
+/**
+ * Kill zombie Tau instances — processes that are alive but orphaned
+ * (e.g. tmux pane was killed without session_shutdown firing).
+ * A zombie is detected by checking if the process has a controlling terminal.
+ * If it doesn't, the HTTP server is the only thing keeping it alive.
+ */
+function cleanupZombieInstances() {
+  if (!fs.existsSync(INSTANCES_DIR)) return;
+  const { execSync } = require("node:child_process");
+  for (const file of fs.readdirSync(INSTANCES_DIR)) {
+    if (!file.endsWith(".json")) continue;
+    try {
+      const info = JSON.parse(fs.readFileSync(path.join(INSTANCES_DIR, file), "utf8"));
+      // Skip our own process
+      if (info.pid === process.pid) continue;
+      // Check if process is alive
+      try {
+        process.kill(info.pid, 0);
+      } catch {
+        // Already dead — clean up
+        try { fs.unlinkSync(path.join(INSTANCES_DIR, file)); } catch {}
+        continue;
+      }
+      // Check if process has a controlling terminal (TTY)
+      // Orphaned processes from killed tmux panes lose their TTY
+      try {
+        const tty = execSync(`ps -o tty= -p ${info.pid}`, { encoding: "utf8" }).trim();
+        if (!tty || tty === "??" || tty === "-") {
+          // No terminal — this is a zombie, kill it
+          console.log(`[Mirror] Killing zombie Tau instance (PID ${info.pid}, port ${info.port})`);
+          process.kill(info.pid, "SIGTERM");
+          try { fs.unlinkSync(path.join(INSTANCES_DIR, file)); } catch {}
+        }
+      } catch {
+        // ps failed — process might have died between checks, clean up
+        try { fs.unlinkSync(path.join(INSTANCES_DIR, file)); } catch {}
+      }
+    } catch {}
+  }
+}
+
 // MIME types for static file serving
 const MIME_TYPES: Record<string, string> = {
   ".html": "text/html",
@@ -146,6 +188,60 @@ export default function (pi: ExtensionAPI) {
 
   let mirrorUrl = "";
   let tailscaleUrl = "";
+
+  // ═══════════════════════════════════════
+  // Helper: stop the server
+  // ═══════════════════════════════════════
+  function stopServer() {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+    if (wss) {
+      for (const client of clients) {
+        client.close();
+      }
+      clients.clear();
+      wss.close();
+      wss = null;
+    }
+    if (server) {
+      server.close();
+      server = null;
+    }
+    unregisterInstance();
+    mirrorUrl = "";
+    tailscaleUrl = "";
+  }
+
+  // ═══════════════════════════════════════
+  // /tau-stop and /tau-start commands
+  // ═══════════════════════════════════════
+  pi.registerCommand("taustop", {
+    description: "Stop the Tau mirror server",
+    handler: async (_args, ctx) => {
+      if (!server) {
+        ctx.ui.notify("Tau is not running", "warning");
+        return;
+      }
+      stopServer();
+      ctx.ui.setStatus("mirror", "");
+      ctx.ui.notify("Tau mirror server stopped", "info");
+      console.log("[Mirror] Server stopped via /taustop");
+    },
+  });
+
+  pi.registerCommand("taustart", {
+    description: "Start the Tau mirror server",
+    handler: async (_args, ctx) => {
+      if (server) {
+        ctx.ui.notify(`Tau is already running at ${mirrorUrl}`, "warning");
+        return;
+      }
+      startServer(ctx);
+      ctx.ui.notify("Tau mirror server starting...", "info");
+    },
+  });
 
   // ═══════════════════════════════════════
   // /qr command — show QR code to connect
@@ -1176,12 +1272,13 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   }
 
   // ═══════════════════════════════════════
-  // Start the server
+  // Start server function (reusable)
   // ═══════════════════════════════════════
-  pi.on("session_start", async (_event, ctx) => {
-    latestCtx = ctx;
-
+  function startServer(ctx: ExtensionContext) {
     if (server) return; // Already running
+
+    // Clean up zombie instances from killed tmux panes etc.
+    cleanupZombieInstances();
 
     server = http.createServer(serveStaticFile);
     wss = new WebSocketServer({ noServer: true });
@@ -1324,29 +1421,27 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     };
 
     tryListen(PORT);
+  }
+
+  // ═══════════════════════════════════════
+  // Auto-start on session begin
+  // ═══════════════════════════════════════
+  pi.on("session_start", async (_event, ctx) => {
+    latestCtx = ctx;
+
+    if (!TAU_AUTO_START) {
+      console.log("[Mirror] Tau auto-start disabled (TAU_DISABLED=1). Use /tau-start to start manually.");
+      return;
+    }
+
+    startServer(ctx);
   });
 
   // ═══════════════════════════════════════
   // Cleanup on shutdown
   // ═══════════════════════════════════════
   pi.on("session_shutdown", async () => {
-    if (heartbeatTimer) {
-      clearInterval(heartbeatTimer);
-      heartbeatTimer = null;
-    }
-    if (wss) {
-      for (const client of clients) {
-        client.close();
-      }
-      clients.clear();
-      wss.close();
-      wss = null;
-    }
-    if (server) {
-      server.close();
-      server = null;
-    }
-    unregisterInstance();
+    stopServer();
     console.log("[Mirror] Server shut down");
   });
 }
