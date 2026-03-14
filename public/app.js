@@ -10,6 +10,7 @@ import { DialogHandler } from './dialogs.js';
 import { SessionSidebar } from './session-sidebar.js';
 import { themes, applyTheme, getCurrentTheme } from './themes.js';
 import { FileBrowser } from './file-browser.js';
+import { Launcher } from './launcher.js';
 
 
 // Initialize components
@@ -1794,11 +1795,87 @@ if (isMobile()) {
   });
 }
 
+// Launcher
+const launcherEl = document.getElementById('launcher');
+const launcher = new Launcher(launcherEl, async (projectPath) => {
+  try {
+    const res = await fetch('/api/projects/launch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: projectPath }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      // Refresh the launcher to show the new active instance
+      setTimeout(() => launcher.load(), 2000);
+    }
+  } catch (e) {
+    console.error('[Launcher] Failed to launch:', e);
+  }
+});
+
+// Check if launcher should show (projects configured)
+async function initLauncher() {
+  try {
+    const res = await fetch('/api/projects');
+    const data = await res.json();
+    if (data.projects && data.projects.length > 0) {
+      launcher.projects = data.projects;
+      launcher.render();
+      // Show launcher by default, add a nav link in the sidebar
+      addLauncherNav();
+    }
+  } catch {}
+}
+
+function addLauncherNav() {
+  const modeToggle = document.getElementById('mode-toggle');
+  if (!modeToggle || modeToggle.querySelector('.mode-link-launcher')) return;
+
+  const launcherLink = document.createElement('span');
+  launcherLink.className = 'mode-link mode-link-launcher';
+  launcherLink.title = 'Projects';
+  launcherLink.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>';
+  launcherLink.addEventListener('click', () => {
+    showLauncher();
+  });
+  modeToggle.appendChild(launcherLink);
+}
+
+function showLauncher() {
+  launcherEl.classList.remove('hidden');
+  messagesContainer.style.display = 'none';
+  document.querySelector('.input-area').style.display = 'none';
+  document.querySelector('.welcome')?.remove();
+
+  // Update nav state
+  document.querySelectorAll('.mode-link').forEach(l => l.classList.remove('active'));
+  document.querySelector('.mode-link-launcher')?.classList.add('active');
+
+  launcher.load();
+}
+
+function hideLauncher() {
+  launcherEl.classList.add('hidden');
+  messagesContainer.style.display = '';
+  document.querySelector('.input-area').style.display = '';
+
+  // Update nav state
+  document.querySelectorAll('.mode-link').forEach(l => l.classList.remove('active'));
+  document.querySelector('.mode-link:first-child')?.classList.add('active');
+}
+
+// Make the tau icon in sidebar switch back to chat
+document.querySelector('.mode-link:first-child')?.addEventListener('click', () => {
+  hideLauncher();
+});
+
 wsClient.connect();
 messageRenderer.renderWelcome();
 sidebar.loadSessions().then(() => {
   if (isMirrorMode) updateMirrorLiveIndicator();
 });
+initLauncher();
 
 // Register service worker for PWA
 if ('serviceWorker' in navigator) {

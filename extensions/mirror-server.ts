@@ -18,7 +18,7 @@ import * as path from "node:path";
 import QRCode from "qrcode";
 
 // Load tau settings from ~/.pi/agent/settings.json (falls back to env vars)
-function loadTauSettings(): { port: number; autoStart: boolean; user: string; pass: string; authEnabled?: boolean } {
+function loadTauSettings(): { port: number; autoStart: boolean; user: string; pass: string; authEnabled?: boolean; projectsDir?: string } {
   let settings: any = {};
   try {
     const settingsPath = path.join(process.env.HOME || "~", ".pi/agent/settings.json");
@@ -33,6 +33,7 @@ function loadTauSettings(): { port: number; autoStart: boolean; user: string; pa
     user: process.env.TAU_USER || settings.user || "",
     pass: process.env.TAU_PASS || settings.pass || "",
     authEnabled: settings.authEnabled,
+    projectsDir: process.env.TAU_PROJECTS_DIR || settings.projectsDir,
   };
 }
 
@@ -894,6 +895,44 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return;
     }
 
+    if (urlPath === "/api/projects" && req.method === "GET") {
+      serveProjectsList(res);
+      return;
+    }
+
+    if (urlPath === "/api/projects/launch" && req.method === "POST") {
+      let body = "";
+      req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+      req.on("end", () => {
+        try {
+          const { path: projectPath } = JSON.parse(body);
+          if (!projectPath || typeof projectPath !== "string") {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "path required" }));
+            return;
+          }
+          // Resolve ~ in path
+          const resolved = projectPath.startsWith("~")
+            ? path.join(process.env.HOME || "", projectPath.slice(1))
+            : projectPath;
+          if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Directory not found" }));
+            return;
+          }
+          const { execSync } = require("node:child_process");
+          const escaped = resolved.replace(/'/g, "'\\''");
+          execSync(`osascript -e 'tell app "iTerm2" to create window with default profile command "cd '"'"'${escaped}'"'"' && pi"'`);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (e: any) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+      return;
+    }
+
     if (urlPath === "/api/sessions" && req.method === "GET") {
       serveSessionsList(res);
       return;
@@ -1027,6 +1066,73 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return tmuxFiles;
     } catch {
       return new Set();
+    }
+  }
+
+  function serveProjectsList(res: http.ServerResponse) {
+    const projectsDir = TAU_SETTINGS.projectsDir;
+    if (!projectsDir) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ projects: [] }));
+      return;
+    }
+
+    const resolved = projectsDir.startsWith("~")
+      ? path.join(process.env.HOME || "", projectsDir.slice(1))
+      : projectsDir;
+
+    if (!fs.existsSync(resolved)) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ projects: [], error: "Directory not found" }));
+      return;
+    }
+
+    try {
+      const entries = fs.readdirSync(resolved, { withFileTypes: true });
+      const instances = getRunningInstances();
+
+      // Build session count + recency map from session history
+      const sessionInfo = new Map<string, { count: number; lastActive: number }>();
+      if (fs.existsSync(SESSIONS_DIR)) {
+        for (const dir of fs.readdirSync(SESSIONS_DIR, { withFileTypes: true })) {
+          if (!dir.isDirectory()) continue;
+          const decodedPath = dir.name.replace(/^--/, "/").replace(/--$/, "").replace(/-/g, "/");
+          // Check if this session dir maps to a subdirectory of the projects folder
+          if (!decodedPath.startsWith(resolved + "/") && !decodedPath.startsWith(resolved)) continue;
+
+          const sessionDir = path.join(SESSIONS_DIR, dir.name);
+          const files = fs.readdirSync(sessionDir).filter(f => f.endsWith(".jsonl"));
+          let lastMtime = 0;
+          for (const f of files) {
+            try {
+              const stat = fs.statSync(path.join(sessionDir, f));
+              if (stat.mtimeMs > lastMtime) lastMtime = stat.mtimeMs;
+            } catch {}
+          }
+          sessionInfo.set(decodedPath, { count: files.length, lastActive: lastMtime });
+        }
+      }
+
+      const projects = entries
+        .filter(e => e.isDirectory() && !e.name.startsWith("."))
+        .map(e => {
+          const fullPath = path.join(resolved, e.name);
+          const info = sessionInfo.get(fullPath) || { count: 0, lastActive: 0 };
+          const isActive = instances.some(i => i.cwd === fullPath);
+          return {
+            name: e.name,
+            path: fullPath,
+            sessionCount: info.count,
+            lastActive: info.lastActive || null,
+            active: isActive,
+          };
+        });
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ projects }));
+    } catch (e: any) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
     }
   }
 
