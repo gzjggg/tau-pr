@@ -93,6 +93,29 @@ Environment variables (set before starting Pi):
 | `TAU_MIRROR_PORT` | `3001` | Server port |
 | `TAU_STATIC_DIR` | *(bundled)* | Override static files path |
 | `TAU_DISABLED` | `0` | Set to `1` to disable Tau (it stays installed but won't start the server) |
+| `TAU_USER` | *(none)* | HTTP Basic Auth username (both `TAU_USER` and `TAU_PASS` required to enable) |
+| `TAU_PASS` | *(none)* | HTTP Basic Auth password |
+
+### Authentication
+
+Tau supports optional HTTP Basic Auth (browser-native login popup).
+
+**1. Set credentials** — add to `~/.pi/agent/settings.json`:
+
+```json
+{
+  "tau": {
+    "user": "pi",
+    "pass": "your-password"
+  }
+}
+```
+
+Or via environment variables: `TAU_USER=pi TAU_PASS=secret pi`
+
+**2. Toggle on/off** — once credentials are configured, a "Require login" toggle appears in Settings within the Tau web UI. Flip it on to start requiring authentication, off to open it back up. The setting persists across restarts.
+
+Both HTTP and WebSocket connections are gated when enabled. The `/api/health` endpoint remains open for monitoring.
 
 ### Start / Stop
 

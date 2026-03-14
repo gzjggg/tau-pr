@@ -1524,6 +1524,19 @@ async function openSettings() {
   } catch (e) {
     // Silent
   }
+
+  // Fetch auth state
+  try {
+    const authData = await rpcCommand({ type: 'get_auth' });
+    if (authData?.success && authData.data?.configured) {
+      authSection.style.display = '';
+      toggleAuth.className = `settings-toggle${authData.data.enabled ? ' on' : ''}`;
+    } else {
+      authSection.style.display = 'none';
+    }
+  } catch {
+    authSection.style.display = 'none';
+  }
 }
 
 function closeSettings() {
@@ -1562,6 +1575,18 @@ toggleShowThinking.addEventListener('click', () => {
   toggleShowThinking.className = `settings-toggle${isOn ? '' : ' on'}`;
   document.body.classList.toggle('hide-thinking', isOn);
   localStorage.setItem('tau-show-thinking', !isOn);
+});
+
+// Auth toggle
+const toggleAuth = document.getElementById('toggle-auth');
+const authSection = document.getElementById('settings-auth-section');
+
+toggleAuth.addEventListener('click', async () => {
+  const isOn = toggleAuth.classList.contains('on');
+  const data = await rpcCommand({ type: 'set_auth', enabled: !isOn });
+  if (data?.success) {
+    toggleAuth.className = `settings-toggle${!isOn ? ' on' : ''}`;
+  }
 });
 
 

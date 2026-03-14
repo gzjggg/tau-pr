@@ -17,8 +17,32 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import QRCode from "qrcode";
 
-const PORT = parseInt(process.env.TAU_MIRROR_PORT || "3001");
-const TAU_AUTO_START = !(process.env.TAU_DISABLED === "1" || process.env.TAU_DISABLED === "true");
+// Load tau settings from ~/.pi/agent/settings.json (falls back to env vars)
+function loadTauSettings(): { port: number; autoStart: boolean; user: string; pass: string; authEnabled?: boolean } {
+  let settings: any = {};
+  try {
+    const settingsPath = path.join(process.env.HOME || "~", ".pi/agent/settings.json");
+    settings = JSON.parse(fs.readFileSync(settingsPath, "utf8")).tau || {};
+  } catch {}
+  return {
+    port: parseInt(process.env.TAU_MIRROR_PORT || settings.port || "3001"),
+    autoStart: !(
+      process.env.TAU_DISABLED === "1" || process.env.TAU_DISABLED === "true" ||
+      settings.disabled === true
+    ),
+    user: process.env.TAU_USER || settings.user || "",
+    pass: process.env.TAU_PASS || settings.pass || "",
+    authEnabled: settings.authEnabled,
+  };
+}
+
+const TAU_SETTINGS = loadTauSettings();
+const PORT = TAU_SETTINGS.port;
+const TAU_AUTO_START = TAU_SETTINGS.autoStart;
+const AUTH_USER = TAU_SETTINGS.user;
+const AUTH_PASS = TAU_SETTINGS.pass;
+const AUTH_CONFIGURED = !!(AUTH_USER && AUTH_PASS);
+let authEnabled = AUTH_CONFIGURED && TAU_SETTINGS.authEnabled !== false;
 // @ts-ignore — __dirname is provided by jiti at runtime
 const STATIC_DIR = process.env.TAU_STATIC_DIR || findPublicDir();
 
@@ -152,6 +176,34 @@ const MIME_TYPES: Record<string, string> = {
   ".woff": "font/woff",
   ".woff2": "font/woff2",
 };
+
+function saveTauSetting(key: string, value: any) {
+  const settingsPath = path.join(process.env.HOME || "~", ".pi/agent/settings.json");
+  try {
+    const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    if (!settings.tau) settings.tau = {};
+    settings.tau[key] = value;
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+  } catch {}
+}
+
+function checkBasicAuth(req: http.IncomingMessage): boolean {
+  if (!authEnabled) return true;
+  const header = req.headers.authorization;
+  if (!header?.startsWith("Basic ")) return false;
+  const decoded = Buffer.from(header.slice(6), "base64").toString();
+  const colon = decoded.indexOf(":");
+  if (colon === -1) return false;
+  return decoded.slice(0, colon) === AUTH_USER && decoded.slice(colon + 1) === AUTH_PASS;
+}
+
+function sendAuthRequired(res: http.ServerResponse) {
+  res.writeHead(401, {
+    "WWW-Authenticate": 'Basic realm="Tau"',
+    "Content-Type": "application/json",
+  });
+  res.end(JSON.stringify({ error: "Unauthorized" }));
+}
 
 export default function (pi: ExtensionAPI) {
   let server: http.Server | null = null;
@@ -714,6 +766,24 @@ export default function (pi: ExtensionAPI) {
           break;
         }
 
+        // ─── Auth ───
+        case "get_auth": {
+          sendTo(ws, success("get_auth", { configured: AUTH_CONFIGURED, enabled: authEnabled }));
+          break;
+        }
+
+        case "set_auth": {
+          if (!AUTH_CONFIGURED) {
+            sendTo(ws, error("set_auth", "No credentials configured. Set tau.user and tau.pass in settings.json"));
+            break;
+          }
+          authEnabled = !!command.enabled;
+          saveTauSetting("authEnabled", authEnabled);
+          broadcast({ type: "event", event: { type: "auth_changed", enabled: authEnabled } });
+          sendTo(ws, success("set_auth", { enabled: authEnabled }));
+          break;
+        }
+
         default: {
           sendTo(ws, error(command.type, `Unknown command: ${command.type}`));
         }
@@ -728,6 +798,12 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════
   function serveStaticFile(req: http.IncomingMessage, res: http.ServerResponse) {
     let urlPath = req.url || "/";
+
+    // Auth gate — exempt /api/health for monitoring
+    if (authEnabled && urlPath !== "/api/health" && !checkBasicAuth(req)) {
+      sendAuthRequired(res);
+      return;
+    }
 
     // Handle API routes
     if (urlPath.startsWith("/api/")) {
@@ -1284,6 +1360,11 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     wss = new WebSocketServer({ noServer: true });
 
     server.on("upgrade", (request, socket, head) => {
+      if (authEnabled && !checkBasicAuth(request)) {
+        socket.write("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Tau\"\r\n\r\n");
+        socket.destroy();
+        return;
+      }
       if (request.url === "/ws") {
         wss!.handleUpgrade(request, socket, head, (ws) => {
           wss!.emit("connection", ws, request);
