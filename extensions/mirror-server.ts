@@ -895,11 +895,39 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return;
     }
 
-    if (urlPath === "/api/instances") {
-      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(JSON.stringify({ instances: getRunningInstances() }));
+    // File preview — serve image bytes for thumbnail display in the browser
+    if ((urlPath === "/api/file/preview" || urlPath.startsWith("/api/file/preview?")) && req.method === "GET") {
+      const previewUrl = new URL(`http://localhost${req.url}`);
+      const filePath = previewUrl.searchParams.get("path");
+      if (!filePath) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "path required" }));
+        return;
+      }
+      const IMAGE_PREVIEW_MIMES: Record<string, string> = {
+        png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+        gif: "image/gif", webp: "image/webp", svg: "image/svg+xml", ico: "image/x-icon",
+      };
+      const ext = path.extname(filePath).toLowerCase().slice(1);
+      const mimeType = IMAGE_PREVIEW_MIMES[ext];
+      if (!mimeType) {
+        res.writeHead(415, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Not a previewable image" }));
+        return;
+      }
+      try {
+        const stat = fs.statSync(filePath);
+        if (!stat.isFile()) throw new Error("Not a file");
+        res.writeHead(200, { "Content-Type": mimeType, "Cache-Control": "max-age=60" });
+        fs.createReadStream(filePath).pipe(res);
+      } catch (err: any) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
       return;
     }
+
+    if (urlPath === "/api/instances") {
 
     if (urlPath === "/api/projects" && req.method === "GET") {
       serveProjectsList(res);

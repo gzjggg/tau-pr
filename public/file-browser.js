@@ -24,7 +24,7 @@ const FILE_ICONS = {
   default: '📄',
 };
 
-function getFileIcon(name, isDirectory) {
+export function getFileIcon(name, isDirectory) {
   if (isDirectory) return FILE_ICONS.directory;
   const ext = name.split('.').pop()?.toLowerCase() || '';
   return FILE_ICONS[ext] || FILE_ICONS.default;
@@ -38,10 +38,11 @@ function formatSize(bytes) {
 }
 
 export class FileBrowser {
-  constructor(container, pathEl, messageInput) {
+  constructor(container, pathEl, messageInput, onFileInserted = null) {
     this.container = container;
     this.pathEl = pathEl;
     this.messageInput = messageInput;
+    this.onFileInserted = onFileInserted;
     this.currentPath = null;
 
     this.setupDropTarget();
@@ -158,6 +159,7 @@ export class FileBrowser {
     input.selectionStart = input.selectionEnd = start + filePath.length + 1;
     input.focus();
     input.dispatchEvent(new Event('input'));
+    if (this.onFileInserted) this.onFileInserted(filePath);
   }
 
   setupDropTarget() {
