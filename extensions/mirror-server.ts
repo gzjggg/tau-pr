@@ -928,6 +928,10 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     }
 
     if (urlPath === "/api/instances") {
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ instances: getRunningInstances() }));
+      return;
+    }
 
     if (urlPath === "/api/projects" && req.method === "GET") {
       serveProjectsList(res);
