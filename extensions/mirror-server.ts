@@ -137,7 +137,6 @@ function getRunningInstances(): Array<{ port: number; pid: number; sessionFile: 
 function cleanupZombieInstances() {
   if (process.platform === "win32") return;
   if (!fs.existsSync(INSTANCES_DIR)) return;
-  const { execSync } = require("node:child_process");
   for (const file of fs.readdirSync(INSTANCES_DIR)) {
     if (!file.endsWith(".json")) continue;
     try {
@@ -152,21 +151,24 @@ function cleanupZombieInstances() {
         try { fs.unlinkSync(path.join(INSTANCES_DIR, file)); } catch {}
         continue;
       }
-      // Check if process has a controlling terminal (TTY)
-      // Orphaned processes from killed tmux panes lose their TTY
-      try {
-        const tty = execSync(`ps -o tty= -p ${info.pid}`, { encoding: "utf8" }).trim();
-        if (!tty || tty === "??" || tty === "-") {
-          // No terminal — this is a zombie, kill it
-          console.log(`[Mirror] Killing zombie Tau instance (PID ${info.pid}, port ${info.port})`);
-          process.kill(info.pid, "SIGTERM");
-          try { fs.unlinkSync(path.join(INSTANCES_DIR, file)); } catch {}
-        }
-      } catch {
-        // ps failed — process might have died between checks, clean up
+      // Use shared zombie detection
+      if (isZombieProcess(info.pid)) {
+        console.log(`[Mirror] Killing zombie Tau instance (PID ${info.pid}, port ${info.port})`);
+        process.kill(info.pid, "SIGTERM");
         try { fs.unlinkSync(path.join(INSTANCES_DIR, file)); } catch {}
       }
     } catch {}
+  }
+}
+
+function isZombieProcess(pid: number): boolean {
+  if (process.platform === "win32") return false;
+  try {
+    const { execSync } = require("node:child_process");
+    const tty = execSync(`ps -o tty= -p ${pid}`, { encoding: "utf8" }).trim();
+    return !tty || tty === "??" || tty === "-";
+  } catch {
+    return true;
   }
 }
 
@@ -666,7 +668,8 @@ export default function (pi: ExtensionAPI) {
           const idx = levels.indexOf(current);
           const next = levels[(idx + 1) % levels.length];
           pi.setThinkingLevel(next as any);
-          sendTo(ws, success("cycle_thinking_level", { level: next }));
+          const actual = pi.getThinkingLevel();
+          sendTo(ws, success("cycle_thinking_level", { level: actual }));
           break;
         }
 
@@ -1626,7 +1629,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
           // Check if a stale Tau instance owns this port and kill it
           const instances = getRunningInstances();
           const stale = instances.find(i => i.port === port && i.pid !== process.pid);
-          if (stale) {
+          if (stale && isZombieProcess(stale.pid)) {
             console.log(`[Mirror] Port ${port} in use by stale Tau instance (PID ${stale.pid}), killing...`);
             try { process.kill(stale.pid, "SIGTERM"); } catch {}
             // Wait briefly then retry the same port

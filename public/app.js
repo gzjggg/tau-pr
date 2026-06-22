@@ -465,7 +465,7 @@ chatForm.addEventListener('submit', (e) => {
 
 messageInput.addEventListener('keydown', (e) => {
   // Enter sends, Shift+Enter inserts newline
-  if (e.key === 'Enter' && !e.shiftKey) {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault();
     sendMessage();
   }
@@ -1048,7 +1048,7 @@ newSessionBtn.addEventListener('click', () => {
   toolCardRenderer.clear();
   messageRenderer.renderWelcome();
   sidebar.clearActive();
-  viewingActiveSession = false;
+  viewingActiveSession = true;
   updateMirrorInputState();
 });
 
