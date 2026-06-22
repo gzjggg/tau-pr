@@ -1715,6 +1715,14 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   pi.on("session_start", async (_event, ctx) => {
     latestCtx = ctx;
 
+    // Skip mirror startup in subagent child processes
+    // (pi-subagents sets PI_SUBAGENT_CHILD=1; child processes loading Tau
+    // should not attempt to start their own mirror server)
+    if (process.env.PI_SUBAGENT_CHILD === "1") {
+      console.log("[Mirror] Subagent child process detected (PI_SUBAGENT_CHILD=1), skipping auto-start.");
+      return;
+    }
+
     if (!TAU_AUTO_START) {
       console.log("[Mirror] Tau auto-start disabled (TAU_DISABLED=1). Use /tau-start to start manually.");
       return;
