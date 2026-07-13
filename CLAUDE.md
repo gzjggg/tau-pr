@@ -2,64 +2,59 @@
 
 ## Package identity
 
-Repo: **tau** | npm package: **tau-mirror**
+Repo: **tau** (fork) | npm package: **tau-mirror**  
+GitHub: https://github.com/gzjggg/tau  
+Upstream: https://github.com/deflating/tau
 
 Production install (OS-independent):
 ```
-npm install -g git+https://github.com/deflating/tau.git#main
+npm install -g git+https://github.com/gzjggg/tau.git#main
+```
+
+Or via Pi packages path (recommended for local dev):
+```json
+{
+  "packages": ["C:/Users/YOU/projects/tau"]
+}
 ```
 
 ## How Pi loads tau
 
-Pi loads tau from a separate npm project that **shadows the global npm install**:
+Pi can load tau from:
 
-| OS      | Path |
+1. **packages[]** path in `~/.pi/agent/settings.json` (this clone)
+2. Global npm install that may shadow the path
+
+| OS      | Global shadow path |
 |---------|------|
 | Windows | `%USERPROFILE%\.pi\agent\npm\node_modules\tau-mirror\` |
-| macOS   | _to-be-done_ |
+| macOS   | `~/.pi/agent/npm/node_modules/tau-mirror/` |
 
 ## Local dev setup
 
-Run automatically when asked to make or test changes locally.
-
 **Windows (PowerShell):**
 ```powershell
-# Remove Pi's shadowing copy
+# Prefer packages[] path to this repo — no global install needed
+
+# If a shadowing global copy exists:
 cd "$env:USERPROFILE\.pi\agent\npm"
 npm uninstall tau-mirror
-
-# Link this repo to global npm
-cd "<repo root>"
-npm link
 ```
 
-**macOS:**
-```bash
-# to-be-done
-```
-
-After any change to `extensions/mirror-server.ts` — clear jiti cache, then tell the user to restart Pi:
+After any change to `extensions/mirror-server.ts` — clear jiti cache, then restart Pi:
 
 **Windows:**
 ```powershell
 Remove-Item "$env:LOCALAPPDATA\Temp\jiti" -Recurse -Force -ErrorAction SilentlyContinue
 ```
 
-**macOS:**
+**macOS / Linux:**
 ```bash
-# to-be-done
+rm -rf /tmp/jiti 2>/dev/null; rm -rf "${TMPDIR:-/tmp}/jiti" 2>/dev/null
 ```
 
-`public/` changes take effect on browser reload — no Pi restart needed.
+## Defaults in this fork
 
-## Restore production install
-
-**Windows:**
-```powershell
-npm install -g git+https://github.com/deflating/tau.git#main
-```
-
-**macOS:**
-```bash
-# to-be-done
-```
+- Port: **38471** (`TAU_MIRROR_PORT` / `tau.port`)
+- Auto-open browser: on (`TAU_AUTO_OPEN=0` to disable)
+- Brand mark: black body **34×36** (`public/icons/brand-mark.svg`)

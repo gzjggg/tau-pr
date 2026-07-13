@@ -11,14 +11,25 @@ import { SessionSidebar } from './session-sidebar.js';
 import { themes, applyTheme, getCurrentTheme } from './themes.js';
 import { FileBrowser, getFileIcon } from './file-browser.js';
 import { Launcher } from './launcher.js';
+import { CommandStore, commandState } from './command-store.js';
+import { createSlashCompletion } from './slash-completion.js';
+import { createCommandPalette } from './command-palette.js';
+import {
+  createSessionCover,
+  updateSessionCover,
+  setSessionCoverVisibility,
+  sessionCoverState,
+} from './session-cover.js';
 
 
 // Initialize components
 const wsUrl = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws';
 const wsClient = new WebSocketClient(wsUrl);
 const state = new StateManager();
-const messageRenderer = new MessageRenderer(document.getElementById('messages'));
-const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages'));
+const messagesEl = document.getElementById('messages');
+const messagesScrollEl = document.getElementById('messages-scroll') || messagesEl;
+const messageRenderer = new MessageRenderer(messagesEl, { scrollRoot: messagesScrollEl });
+const toolCardRenderer = new ToolCardRenderer(messagesEl, { scrollRoot: messagesScrollEl });
 const dialogHandler = new DialogHandler(document.getElementById('dialog-container'), wsClient);
 
 // Session sidebar
@@ -46,7 +57,42 @@ const sessionCostEl = document.getElementById('session-cost');
 const tokenUsageEl = document.getElementById('token-usage');
 const scrollBottomBtn = document.getElementById('scroll-bottom-btn');
 const scrollBottomBadge = document.getElementById('scroll-bottom-badge');
-const messagesContainer = document.getElementById('messages');
+const messagesContainer = messagesScrollEl;
+const prologueSlot = document.getElementById('session-prologue-slot');
+const slashPopup = document.getElementById('slash-popup');
+const commandStore = new CommandStore(wsClient);
+
+/** Reliable scroll-to-bottom (handles post-layout height changes) */
+function scrollToBottom({ force = true } = {}) {
+  const el = messagesContainer;
+  if (!el) return;
+  if (!force && isScrolledUp) return;
+  isScrolledUp = false;
+  hasNewWhileScrolled = false;
+  messageRenderer.isNearBottom = true;
+  const prev = el.style.scrollBehavior;
+  el.style.scrollBehavior = 'auto';
+  const jump = () => { el.scrollTop = el.scrollHeight; };
+  jump();
+  requestAnimationFrame(() => {
+    jump();
+    requestAnimationFrame(() => {
+      jump();
+      el.style.scrollBehavior = prev || '';
+      scrollBottomBtn?.classList.add('hidden');
+      scrollBottomBadge?.classList.add('hidden');
+    });
+  });
+}
+
+function resetScrollState() {
+  isScrolledUp = false;
+  hasNewWhileScrolled = false;
+  messageRenderer.isNearBottom = true;
+  if (messagesContainer) messagesContainer.scrollTop = 0;
+  scrollBottomBtn?.classList.add('hidden');
+  scrollBottomBadge?.classList.add('hidden');
+}
 
 // State tracking
 let currentStreamingElement = null;
@@ -166,10 +212,14 @@ messagesContainer.addEventListener('scroll', () => {
 });
 
 scrollBottomBtn.addEventListener('click', () => {
+  isScrolledUp = false;
+  hasNewWhileScrolled = false;
+  messageRenderer.isNearBottom = true;
   messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
+  // Snap again after smooth scroll finishes
+  setTimeout(() => scrollToBottom({ force: true }), 320);
   scrollBottomBtn.classList.add('hidden');
   scrollBottomBadge.classList.add('hidden');
-  hasNewWhileScrolled = false;
 });
 
 function showNewMessageBadge() {
@@ -218,6 +268,14 @@ wsClient.addEventListener('mirrorSync', (e) => {
 
 function handleRPCEvent(event) {
   switch (event.type) {
+    case 'commands_changed':
+      commandStore.fetchCommands(true);
+      break;
+    case 'session_cover_updated':
+      if (event.patch && prologueSlot) {
+        updateSessionCover(prologueSlot, event.patch);
+      }
+      break;
     case 'agent_start':
       handleAgentStart();
       break;
@@ -464,18 +522,104 @@ chatForm.addEventListener('submit', (e) => {
 });
 
 messageInput.addEventListener('keydown', (e) => {
+  // Slash popup keyboard handling first
+  if (slash.onKeydown(e)) return;
+
   // Enter sends, Shift+Enter inserts newline
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault();
+    // Intercept pure slash commands for execution when capability allows
+    const text = messageInput.value.trim();
+    if (text.startsWith('/') && !text.includes('\n')) {
+      const base = text.split(/\s+/)[0];
+      const cmd = commandState.items.find(
+        (c) => c.invocation === base || `/${c.name}` === base
+      );
+      if (cmd && cmd.capability === 'execute' && cmd.source !== 'tau') {
+        messageInput.value = '';
+        messageInput.style.height = 'auto';
+        executePiCommand({ ...cmd, invocation: text });
+        return;
+      }
+      if (cmd && cmd.source === 'tau') {
+        messageInput.value = '';
+        messageInput.style.height = 'auto';
+        handleTauAction(cmd);
+        return;
+      }
+    }
     sendMessage();
   }
 });
 
-// Auto-resize textarea
+// Auto-resize textarea + slash detection + confirmed-command styling
 messageInput.addEventListener('input', () => {
   messageInput.style.height = 'auto';
   messageInput.style.height = Math.min(messageInput.scrollHeight, 200) + 'px';
+  slash.onInput();
+  updateInputCmdHighlight();
 });
+
+messageInput.addEventListener('scroll', () => {
+  const mirror = document.getElementById('input-cmd-mirror');
+  if (mirror) mirror.scrollTop = messageInput.scrollTop;
+}, { passive: true });
+
+/**
+ * Style confirmed slash/skill tokens in the composer.
+ * Mirror paints accent chip for /command + normal color for args;
+ * textarea is transparent-on-solid so there's no glass fog.
+ */
+function updateInputCmdHighlight() {
+  const bubble = messageInput.closest('.input-bubble');
+  const mirror = document.getElementById('input-cmd-mirror');
+  if (!bubble) return;
+
+  const text = messageInput.value;
+  const m = text.match(/^(\/[\w.:-]+)([\s\S]*)$/);
+  if (!m) {
+    bubble.classList.remove('has-confirmed-cmd', 'has-skill-cmd');
+    if (mirror) mirror.innerHTML = '';
+    return;
+  }
+
+  const inv = m[1];
+  const rest = m[2] || '';
+  const known = commandState.items.find(
+    (c) => c.invocation === inv || `/${c.name}` === inv || c.name === inv.slice(1)
+  );
+
+  const hasSep = rest.startsWith(' ') || rest.startsWith('\n');
+  // Also treat exact known invocation as confirmed (even mid-type if full match)
+  const confirmed = !!known && (hasSep || rest.length === 0);
+
+  if (!confirmed) {
+    bubble.classList.remove('has-confirmed-cmd', 'has-skill-cmd');
+    if (mirror) mirror.innerHTML = '';
+    return;
+  }
+
+  const isSkill =
+    known.source === 'skill' ||
+    inv.startsWith('/skill:') ||
+    /^\/(websearch|web-search)$/i.test(inv);
+
+  bubble.classList.add('has-confirmed-cmd');
+  bubble.classList.toggle('has-skill-cmd', isSkill);
+
+  if (mirror) {
+    const esc = (s) =>
+      String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    // Keep spaces/newlines so layout matches the textarea exactly
+    mirror.innerHTML =
+      `<span class="cmd-tok">${esc(inv)}</span>` +
+      (rest ? `<span class="cmd-rest">${esc(rest)}</span>` : '');
+    mirror.scrollTop = messageInput.scrollTop;
+  }
+}
 
 // ═══════════════════════════════════════
 // Attachments (images + file browser paths)
@@ -729,52 +873,135 @@ abortBtn.addEventListener('click', () => {
 });
 
 // ═══════════════════════════════════════
-// Command Palette
+// Command Center + Slash completion
 // ═══════════════════════════════════════
 
 const commandBtn = document.getElementById('command-btn');
 const commandPalette = document.getElementById('command-palette');
 const commandPaletteOverlay = document.getElementById('command-palette-overlay');
-const commandList = document.getElementById('command-list');
 
-const commands = [
-  { icon: '🗜️', label: 'Compact', desc: 'Compact context to save tokens', action: () => rpcCommand({ type: 'compact' }, 'Compacting...') },
-  { icon: '📋', label: 'Export HTML', desc: 'Export session as HTML file', action: () => rpcExportHtml() },
-  { icon: '📊', label: 'Session Stats', desc: 'Show session statistics', action: () => showSessionStats() },
-  { icon: '⬇️', label: 'Expand All Tools', desc: 'Expand all tool cards', action: () => toolCardRenderer.expandAll() },
-  { icon: '⬆️', label: 'Collapse All Tools', desc: 'Collapse all tool cards', action: () => toolCardRenderer.collapseAll() },
-
-];
-
-function openCommandPalette() {
-  commandList.innerHTML = '';
-  commands.forEach(cmd => {
-    const el = document.createElement('div');
-    el.className = 'command-item';
-    el.innerHTML = `
-      <div class="command-icon">${cmd.icon}</div>
-      <div>
-        <div class="command-label">${cmd.label}</div>
-        <div class="command-desc">${cmd.desc}</div>
-      </div>
-    `;
-    el.addEventListener('click', () => {
-      closeCommandPalette();
-      cmd.action();
-    });
-    commandList.appendChild(el);
-  });
-  commandPalette.classList.remove('hidden');
-  commandPaletteOverlay.classList.remove('hidden');
+function handleTauAction(cmd) {
+  const action = (cmd.invocation || '').replace(/^\/tau:/, '') || cmd.name;
+  switch (action) {
+    case 'settings':
+      document.getElementById('settings-btn')?.click();
+      break;
+    case 'model':
+      document.getElementById('model-dropdown-btn')?.click();
+      break;
+    case 'thinking':
+      document.getElementById('thinking-btn')?.click();
+      break;
+    case 'compact':
+      rpcCommand({ type: 'compact' }, 'Compacting...');
+      break;
+    case 'export-html':
+      rpcExportHtml();
+      break;
+    case 'session-stats':
+      showSessionStats();
+      break;
+    case 'expand-tools':
+      toolCardRenderer.expandAll();
+      break;
+    case 'collapse-tools':
+      toolCardRenderer.collapseAll();
+      break;
+    case 'refresh-commands':
+      commandStore.fetchCommands(true).then(() => {
+        statusText.textContent = 'Commands refreshed';
+        setTimeout(() => { statusText.textContent = 'Connected'; }, 1500);
+      });
+      break;
+    case 'toggle-cover':
+      setSessionCoverVisibility(prologueSlot, !sessionCoverState.visible);
+      break;
+    case 'scroll-start':
+      messagesContainer.scrollTo({ top: 0, behavior: 'smooth' });
+      break;
+    default:
+      console.warn('[Tau] Unknown tau action', action);
+  }
 }
 
-function closeCommandPalette() {
-  commandPalette.classList.add('hidden');
-  commandPaletteOverlay.classList.add('hidden');
+async function executePiCommand(cmd) {
+  if (!viewingActiveSession && isMirrorMode) {
+    statusText.textContent = 'Read-only session';
+    setTimeout(() => { statusText.textContent = 'Connected'; }, 2000);
+    return;
+  }
+  const invocation = cmd.invocation || `/${cmd.name}`;
+
+  // Tau Web actions only via /tau:* — never hijack Pi slash names
+  if (invocation.startsWith('/tau:') || cmd.source === 'tau') {
+    handleTauAction(cmd);
+    return;
+  }
+
+  statusText.textContent = `Running ${invocation}…`;
+  const resp = await commandStore.execute(invocation, state.isStreaming ? 'followUp' : undefined);
+  if (resp?.success && resp.data?.accepted) {
+    if (resp.data.executionMode === 'tau-action') {
+      handleTauAction({ invocation: `/tau:${resp.data.action}`, name: resp.data.action });
+    } else {
+      statusText.textContent = 'Command accepted';
+      setTimeout(() => { statusText.textContent = 'Connected'; }, 1500);
+    }
+  } else if (resp?.data?.executionMode === 'insert-only' || resp?.data?.executionMode === 'terminal-only') {
+    messageInput.value = invocation + (invocation.endsWith(' ') ? '' : ' ');
+    messageInput.focus();
+    statusText.textContent = resp.error || resp.data?.error || 'Run this in the Pi terminal';
+    setTimeout(() => { statusText.textContent = 'Connected'; }, 3000);
+  } else {
+    // Failed Pi dispatch: leave text for user; do not open Tau Settings
+    statusText.textContent = resp?.error || 'Pi command failed — try the terminal';
+    setTimeout(() => { statusText.textContent = 'Connected'; }, 3500);
+  }
 }
 
-commandBtn.addEventListener('click', openCommandPalette);
-commandPaletteOverlay.addEventListener('click', closeCommandPalette);
+const commandCenter = createCommandPalette({
+  palette: commandPalette,
+  overlay: commandPaletteOverlay,
+  listEl: document.getElementById('command-list'),
+  store: commandStore,
+  onTauAction: handleTauAction,
+  onExecute: executePiCommand,
+  onInsert: (text) => {
+    messageInput.value = text;
+    messageInput.focus();
+    messageInput.dispatchEvent(new Event('input'));
+  },
+});
+
+commandBtn.addEventListener('click', () => {
+  if (!commandState.items.length) commandStore.fetchCommands(false);
+  commandCenter.open();
+});
+
+wsClient.addEventListener('rpcResponse', (e) => {
+  commandStore.handleResponse(e.detail);
+});
+
+const slash = createSlashCompletion({
+  input: messageInput,
+  popup: slashPopup,
+  store: commandStore,
+  isReadOnly: () => isMirrorMode && !viewingActiveSession,
+  onInsert: (text) => {
+    messageInput.value = text;
+    messageInput.focus();
+    const len = messageInput.value.length;
+    messageInput.setSelectionRange(len, len);
+    messageInput.dispatchEvent(new Event('input'));
+    updateInputCmdHighlight();
+  },
+  onExecute: executePiCommand,
+  onTauAction: handleTauAction,
+});
+
+wsClient.addEventListener('connected', () => {
+  setTimeout(() => updateInputCmdHighlight(), 0);
+});
 
 async function rpcCommand(cmd, statusMsg) {
   try {
@@ -1137,50 +1364,57 @@ async function handleSessionSelect(session, project) {
   }
 }
 
+/**
+ * Sidebar session selection.
+ *
+ * Strategy (mirror / same Pi process):
+ * 1. Another live Tau instance already owns that session → reconnect WS to that port
+ * 2. Same instance active session → re-sync
+ * 3. Otherwise → ask Pi to switchSession(absolute path) so TUI + Web both move
+ *    (unlike TUI /resume picker, this accepts any session file under ~/.pi/agent/sessions)
+ * 4. If Pi switch fails → fall back to read-only history browse
+ */
 async function switchSession(sessionFile, session = null, project = null) {
   try {
     // Clear any streaming state from previous session to prevent bleed
     currentStreamingElement = null;
     currentStreamingThinking = '';
     currentStreamingText = '';
+    resetScrollState();
     
     state.reset();
     messageRenderer.clear();
     toolCardRenderer.clear();
 
-    if (sessionFile && session) {
-      messageRenderer.renderSystemMessage('Loading session...');
-
-      const dirName = project?.dirName;
-      const file = session.file;
-      console.log('[App] Loading history:', { dirName, file, sessionFile });
-
-      if (dirName && file) {
-        try {
-          const res = await fetch(`/api/sessions/${dirName}/${file}`);
-          console.log('[App] History fetch status:', res.status);
-          const data = await res.json();
-          console.log('[App] History entries:', data.entries?.length || 0);
-
-          messageRenderer.clear();
-          renderSessionHistory(data.entries || []);
-        } catch (e) {
-          console.error('[App] History fetch error:', e);
-        }
+    // New session (null)
+    if (!sessionFile) {
+      if (isMirrorMode) {
+        messageRenderer.renderSystemMessage('Use the Pi terminal or + for a new session in mirror mode.');
+        viewingActiveSession = true;
+        updateMirrorInputState();
+        wsClient.send({ type: 'mirror_sync_request' });
       } else {
-        console.log('[App] Skipped history load: dirName or file missing');
+        messageRenderer.renderWelcome();
+        const res = await fetch('/api/sessions/switch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionFile: null }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          messageRenderer.renderError(err.error || 'Failed to create session');
+        }
       }
-    } else {
-      messageRenderer.renderWelcome();
+      return;
     }
 
-    // In mirror mode, check if this session is live on any instance
+    // In mirror mode, prefer live Pi switch over read-only browse
     if (isMirrorMode) {
-      // Check if this session is live on a different instance
-      const otherInstance = liveInstances.find(i => i.sessionFile === sessionFile && i.port !== new URL(wsClient.url).port * 1);
+      const otherInstance = liveInstances.find(
+        (i) => i.sessionFile === sessionFile && i.port !== Number(new URL(wsClient.url).port)
+      );
       if (otherInstance) {
-        // Reconnect to the other instance
-        const protocol = document.location.protocol === 'https:' ? 'wss:' : 'ws:'
+        const protocol = document.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const newUrl = `${protocol}//${location.hostname}:${otherInstance.port}/ws`;
         console.log(`[App] Switching to instance on port ${otherInstance.port}`);
         wsClient.disconnect();
@@ -1192,29 +1426,100 @@ async function switchSession(sessionFile, session = null, project = null) {
         return;
       }
 
-      // Check if this is the active session on the current instance
-      viewingActiveSession = sessionFile === mirrorActiveSessionFile;
-      updateMirrorInputState();
-
-      if (viewingActiveSession) {
-        // Re-request live state from the extension
+      if (sessionFile === mirrorActiveSessionFile) {
+        viewingActiveSession = true;
+        updateMirrorInputState();
         wsClient.send({ type: 'mirror_sync_request' });
+        return;
       }
-    } else {
-      const res = await fetch('/api/sessions/switch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionFile }),
-      });
 
-      if (!res.ok) {
-        const err = await res.json();
-        messageRenderer.renderError(`Failed to switch session: ${err.error}`);
+      // Ask Pi to switch the live session (absolute path; works across project dirs)
+      messageRenderer.renderSystemMessage('Switching Pi session…');
+      statusText.textContent = 'Switching session…';
+      try {
+        // Prefer WebSocket so we share the same adapter path as execute_command
+        const switched = await requestSessionSwitch(sessionFile);
+        if (switched.ok) {
+          mirrorActiveSessionFile = sessionFile;
+          viewingActiveSession = true;
+          updateMirrorInputState();
+          statusText.textContent = 'Session switched';
+          setTimeout(() => { statusText.textContent = 'Connected'; }, 1500);
+          setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 250);
+          setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 800);
+          return;
+        }
+        console.warn('[App] Live switch failed, opening read-only:', switched.error);
+        messageRenderer.renderSystemMessage(
+          `Could not switch live Pi session (${switched.error || 'unknown'}). Showing history read-only. Tip: run /tau-switch once in the terminal to arm the hook, then retry.`
+        );
+      } catch (e) {
+        console.warn('[App] Live switch error, read-only fallback:', e);
+        messageRenderer.renderSystemMessage('Could not switch live Pi session. Showing history read-only.');
       }
+
+      // Read-only fallback: load history without moving Pi
+      viewingActiveSession = false;
+      updateMirrorInputState();
+      await loadSessionHistory(session, project);
+      return;
     }
+
+    // Non-mirror path
+    const res = await fetch('/api/sessions/switch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionFile }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      messageRenderer.renderError(`Failed to switch session: ${err.error || res.status}`);
+      return;
+    }
+    await loadSessionHistory(session, project);
   } catch (error) {
     console.error('[App] Failed to switch session:', error);
     messageRenderer.renderError('Failed to switch session');
+  }
+}
+
+async function loadSessionHistory(session, project) {
+  if (!session) {
+    messageRenderer.renderWelcome();
+    return;
+  }
+  const dirName = project?.dirName;
+  const file = session.file;
+  if (!dirName || !file) {
+    messageRenderer.renderSystemMessage('Session path incomplete — cannot load history.');
+    return;
+  }
+  try {
+    const res = await fetch(`/api/sessions/${dirName}/${file}`);
+    const data = await res.json();
+    messageRenderer.clear();
+    renderSessionHistory(data.entries || []);
+  } catch (e) {
+    console.error('[App] History fetch error:', e);
+    messageRenderer.renderError('Failed to load session history');
+  }
+}
+
+/** Switch live Pi session via HTTP (primary) with clear error payload */
+async function requestSessionSwitch(sessionFile) {
+  try {
+    const res = await fetch('/api/sessions/switch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionFile }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.success) {
+      return { ok: true };
+    }
+    return { ok: false, error: data.error || `HTTP ${res.status}` };
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) };
   }
 }
 
@@ -1225,6 +1530,7 @@ async function switchSession(sessionFile, session = null, project = null) {
 function handleMirrorSync(data) {
   console.log('[Mirror] Received state snapshot:', data.entries?.length, 'entries');
   isMirrorMode = true;
+  resetScrollState();
 
   // Track the active session
   mirrorActiveSessionFile = data.sessionFile || null;
@@ -1247,7 +1553,29 @@ function handleMirrorSync(data) {
     updateThinkingBtn();
   }
 
-  // Clear and render message history
+  // Commands + session cover from snapshot
+  if (data.commands || data.commandAdapter) {
+    commandStore.setFromMirrorSync(data.commands, data.commandAdapter);
+  } else {
+    commandStore.fetchCommands(false);
+  }
+
+  sessionCoverState.animationPlayed = false;
+  if (data.sessionCover) {
+    createSessionCover(prologueSlot, data.sessionCover, { animate: true });
+  } else {
+    createSessionCover(prologueSlot, {
+      sessionName: data.sessionName,
+      model: data.model
+        ? { provider: data.model.provider, id: data.model.id, displayName: data.model.name || data.model.id }
+        : undefined,
+      thinkingLevel: data.thinkingLevel,
+      contextUsage: data.contextUsage,
+      generatedAt: Date.now(),
+    }, { animate: true });
+  }
+
+  // Clear and render message history (prologue slot is outside #messages)
   messageRenderer.clear();
   sessionTotalCost = 0;
   lastInputTokens = 0;
@@ -1256,6 +1584,7 @@ function handleMirrorSync(data) {
     renderSessionHistory(data.entries);
   } else {
     messageRenderer.renderWelcome();
+    scrollToBottom({ force: true });
   }
 
   updateCostDisplay();
@@ -1296,7 +1625,7 @@ function updateMirrorInputState() {
   const inputArea = document.querySelector('.input-area');
   if (viewingActiveSession) {
     messageInput.disabled = false;
-    messageInput.placeholder = 'Message...';
+    messageInput.placeholder = 'Type / for commands · Enter to send · Shift+Enter newline';
     inputArea?.classList.remove('mirror-readonly');
   } else {
     messageInput.disabled = true;
@@ -1401,16 +1730,7 @@ function renderSessionHistory(entries) {
   updateTokenUsage();
   fetchContextWindow();
 
-  // Jump to bottom instantly (no smooth scroll animation)
-  const messagesEl = document.getElementById('messages');
-  messagesEl.style.scrollBehavior = 'auto';
-  requestAnimationFrame(() => {
-    messagesEl.scrollTop = messagesEl.scrollHeight;
-    // Restore smooth scrolling after a frame
-    requestAnimationFrame(() => {
-      messagesEl.style.scrollBehavior = '';
-    });
-  });
+  scrollToBottom({ force: true });
 }
 
 // ═══════════════════════════════════════
@@ -1968,4 +2288,40 @@ if (splash) {
   });
 }
 
-console.log('🚀 Tau initialized');
+// ═══════════════════════════════════════
+// Close Web UI → stop Tau port + exit Pi process
+// ═══════════════════════════════════════
+let piShutdownSent = false;
+function requestPiShutdown(reason = 'web_ui_closed') {
+  if (piShutdownSent) return;
+  piShutdownSent = true;
+  const payload = JSON.stringify({ reason });
+
+  try {
+    if (navigator.sendBeacon) {
+      const blob = new Blob([payload], { type: 'application/json' });
+      if (navigator.sendBeacon('/api/shutdown', blob)) {
+        console.log('[Tau] Shutdown beacon sent:', reason);
+        return;
+      }
+    }
+  } catch { /* fall through */ }
+
+  try {
+    fetch('/api/shutdown', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: payload,
+      keepalive: true,
+    }).catch(() => {});
+  } catch { /* ignore */ }
+
+  try {
+    wsClient?.send?.({ type: 'shutdown', reason });
+  } catch { /* ignore */ }
+}
+
+window.addEventListener('pagehide', () => requestPiShutdown('pagehide'));
+window.addEventListener('beforeunload', () => requestPiShutdown('beforeunload'));
+
+console.log('[Tau] initialized');

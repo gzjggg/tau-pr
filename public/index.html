@@ -23,7 +23,7 @@
     <div class="sidebar" id="sidebar">
       <div class="sidebar-header">
         <div class="mode-toggle" id="mode-toggle">
-          <span class="mode-link active" title="Chat"><img src="icons/tau-192.png" alt="τ" class="tau-icon"></span>
+          <span class="mode-link active" title="Chat"><img src="icons/brand-mark.svg" alt="PI Agent" class="tau-icon brand-mark-icon"></span>
         </div>
         <input type="text" id="session-search-input" class="sidebar-search-input" placeholder="Search..." autocomplete="off" />
         <div class="sidebar-actions">
@@ -84,15 +84,19 @@
       <!-- Launcher (project picker) -->
       <div class="launcher hidden" id="launcher"></div>
 
-      <!-- Messages Container -->
-      <div class="messages" id="messages">
-        <div class="welcome">
-          <div class="welcome-icon"><img src="icons/tau-192.png" alt="τ" class="tau-icon-welcome"></div>
-          <p>Welcome to Tau</p>
-          <p class="hint">Type a message below to start chatting with Pi, or select a session from the sidebar.</p>
-          <div class="shortcuts-hint">
-            <span>/ Focus input</span>
-            <span>Esc Abort</span>
+      <!-- Messages scroll area: prologue slot survives message re-renders -->
+      <div class="messages-scroll" id="messages-scroll">
+        <div id="session-prologue-slot"></div>
+        <!-- Messages Container -->
+        <div class="messages" id="messages">
+          <div class="welcome">
+            <div class="welcome-icon"><img src="icons/tau-192.png" alt="τ" class="tau-icon-welcome"></div>
+            <p>Welcome to Tau</p>
+            <p class="hint">Type a message below to start chatting with Pi, or select a session from the sidebar.</p>
+            <div class="shortcuts-hint">
+              <span>/ browse commands</span>
+              <span>Esc Abort</span>
+            </div>
           </div>
         </div>
       </div>
@@ -125,17 +129,25 @@
 
             <input type="file" id="image-input" accept="image/*" multiple style="display:none" />
           </div>
-          <div class="input-bubble">
+          <div class="input-bubble-wrap">
+            <div id="slash-popup" class="slash-popup hidden" role="listbox" aria-label="Command suggestions"></div>
+            <div class="input-bubble">
+            <span class="input-cmd-chip" id="input-cmd-chip" aria-hidden="true"></span>
+            <div class="input-cmd-mirror" id="input-cmd-mirror" aria-hidden="true"></div>
             <textarea
               id="message-input"
-              placeholder="Type a message... (Enter to send, Shift+Enter for newline)"
+              placeholder="Type / for commands · Enter to send · Shift+Enter newline"
               autocomplete="off"
+              spellcheck="false"
+              autocapitalize="off"
+              autocorrect="off"
               rows="2"
 
             ></textarea>
             <button type="button" class="input-mic-btn" id="mic-btn" title="Voice input" tabindex="-1">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
             </button>
+          </div>
           </div>
           <div class="input-actions">
             <button type="submit" id="send-btn" title="Send message" tabindex="-1">
@@ -174,6 +186,7 @@
       <button class="settings-close" id="settings-close"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
     </div>
     <div class="settings-body">
+      <p class="settings-note">These options apply to <strong>Tau Web</strong> only. Pi TUI settings stay in the terminal (<code>/settings</code>).</p>
       <div class="settings-section">
         <div class="settings-section-title">Appearance</div>
         <div class="theme-grid" id="theme-grid"></div>
@@ -206,7 +219,7 @@
     </div>
   </div>
 
-  <!-- Command Palette -->
+  <!-- Command Palette / Command Center -->
   <div class="command-palette-overlay hidden" id="command-palette-overlay"></div>
   <div class="command-palette hidden" id="command-palette">
     <div class="command-palette-header">Commands</div>

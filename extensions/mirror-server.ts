@@ -16,37 +16,84 @@ import * as http from "node:http";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { exec, execFile } from "node:child_process";
 import QRCode from "qrcode";
+import {
+  createPiCommandAdapter,
+  refreshSessionCapture,
+  setSessionSwitcher,
+  switchPiSession,
+  type CommandDescriptor,
+  type PiCommandAdapter,
+} from "./pi-command-adapter";
 
 // Load tau settings from ~/.pi/agent/settings.json (falls back to env vars)
-function loadTauSettings(): { port: number; host: string; autoStart: boolean; user: string; pass: string; authEnabled?: boolean; projectsDir?: string } {
+function loadTauSettings(): {
+  port: number;
+  host: string;
+  autoStart: boolean;
+  autoOpenBrowser: boolean;
+  user: string;
+  pass: string;
+  authEnabled?: boolean;
+  projectsDir?: string;
+  allowRemoteCommandExecution?: boolean;
+} {
   let settings: any = {};
   try {
-    const settingsPath = path.join(process.env.HOME || "~", ".pi/agent/settings.json");
+    const home = os.homedir() || process.env.USERPROFILE || process.env.HOME || "";
+    const settingsPath = path.join(home, ".pi", "agent", "settings.json");
     settings = JSON.parse(fs.readFileSync(settingsPath, "utf8")).tau || {};
   } catch {}
+  const autoOpenEnv = process.env.TAU_AUTO_OPEN;
+  const autoOpenBrowser =
+    autoOpenEnv === "0" || autoOpenEnv === "false"
+      ? false
+      : autoOpenEnv === "1" || autoOpenEnv === "true"
+        ? true
+        : settings.autoOpenBrowser !== false;
   return {
-    port: parseInt(process.env.TAU_MIRROR_PORT || settings.port || "3001"),
+    // 38471 — uncommon port to avoid clashes with typical dev servers (3000/3001/5173…)
+    port: parseInt(process.env.TAU_MIRROR_PORT || String(settings.port || "38471"), 10),
     host: process.env.TAU_HOST || settings.host || "0.0.0.0",
     autoStart: !(
       process.env.TAU_DISABLED === "1" || process.env.TAU_DISABLED === "true" ||
       settings.disabled === true
     ),
+    autoOpenBrowser,
     user: process.env.TAU_USER || settings.user || "",
     pass: process.env.TAU_PASS || settings.pass || "",
     authEnabled: settings.authEnabled,
     projectsDir: process.env.TAU_PROJECTS_DIR || settings.projectsDir,
+    allowRemoteCommandExecution: settings.allowRemoteCommandExecution === true,
   };
+}
+
+/** Cross-platform open URL in default browser */
+function openInBrowser(url: string): void {
+  try {
+    if (process.platform === "win32") {
+      exec(`cmd /c start "" "${url.replace(/"/g, "")}"`);
+    } else if (process.platform === "darwin") {
+      execFile("open", [url]);
+    } else {
+      execFile("xdg-open", [url]);
+    }
+  } catch (e) {
+    console.warn("[Mirror] Failed to open browser:", (e as Error).message);
+  }
 }
 
 const TAU_SETTINGS = loadTauSettings();
 const PORT = TAU_SETTINGS.port;
 const HOST = TAU_SETTINGS.host;
 const TAU_AUTO_START = TAU_SETTINGS.autoStart;
+const TAU_AUTO_OPEN = TAU_SETTINGS.autoOpenBrowser;
 const AUTH_USER = TAU_SETTINGS.user;
 const AUTH_PASS = TAU_SETTINGS.pass;
 const AUTH_CONFIGURED = !!(AUTH_USER && AUTH_PASS);
 let authEnabled = AUTH_CONFIGURED && TAU_SETTINGS.authEnabled !== false;
+let browserOpenedOnce = false;
 // @ts-ignore — __dirname is provided by jiti at runtime
 const STATIC_DIR = process.env.TAU_STATIC_DIR || findPublicDir();
 
@@ -187,7 +234,8 @@ const MIME_TYPES: Record<string, string> = {
 };
 
 function saveTauSetting(key: string, value: any) {
-  const settingsPath = path.join(process.env.HOME || "~", ".pi/agent/settings.json");
+  const home = os.homedir() || process.env.USERPROFILE || process.env.HOME || "";
+  const settingsPath = path.join(home, ".pi", "agent", "settings.json");
   try {
     const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
     if (!settings.tau) settings.tau = {};
@@ -215,6 +263,13 @@ function sendAuthRequired(res: http.ServerResponse) {
 }
 
 export default function (pi: ExtensionAPI) {
+  // Install session-switch hooks ASAP (before interactive mode binds command context)
+  try {
+    createPiCommandAdapter(pi as any);
+  } catch (e) {
+    console.warn("[Mirror] Early adapter init:", (e as Error).message);
+  }
+
   let server: http.Server | null = null;
   let wss: WebSocketServer | null = null;
   let heartbeatTimer: NodeJS.Timeout | null = null;
@@ -222,6 +277,179 @@ export default function (pi: ExtensionAPI) {
 
   // Store latest context reference for use in command handlers
   let latestCtx: ExtensionContext | null = null;
+
+  /** Arm Web sidebar session switch from any ExtensionCommandContext */
+  function armSessionSwitcher(ctx: { switchSession: (p: string, o?: any) => Promise<any> }) {
+    if (typeof ctx?.switchSession === "function") {
+      setSessionSwitcher((sessionPath, options) => ctx.switchSession(sessionPath, options));
+      console.log("[Mirror] Session switcher armed from command context");
+    }
+  }
+
+  // Capture switchSession from command context (most reliable path)
+  pi.registerCommand("tau-switch", {
+    description: "Switch live Pi session (Tau Web sidebar). Args: absolute session .jsonl path",
+    handler: async (args, ctx) => {
+      armSessionSwitcher(ctx);
+      const target = (args || "").trim();
+      if (!target) {
+        ctx.ui.notify("Tau switchSession hook ready — sidebar can switch sessions now", "info");
+        return;
+      }
+      try {
+        const result = await ctx.switchSession(target);
+        if (result?.cancelled) {
+          ctx.ui.notify("Session switch cancelled", "warning");
+          return;
+        }
+        ctx.ui.notify("Switched session", "info");
+      } catch (e: any) {
+        ctx.ui.notify(`Switch failed: ${e?.message || e}`, "error");
+        throw e;
+      }
+    },
+  });
+
+  // Command discovery / execution (Pi adapter + Tau actions)
+  const commandAdapter: PiCommandAdapter = createPiCommandAdapter(pi as any);
+  let commandsCache: { at: number; commands: CommandDescriptor[]; adapter: ReturnType<PiCommandAdapter["info"]> } | null = null;
+  const COMMANDS_TTL_MS = 30_000;
+  let gitCache: { at: number; branch?: string; dirty?: boolean } | null = null;
+
+  const TAU_ACTIONS: CommandDescriptor[] = [
+    { id: "tau:settings", name: "settings", invocation: "/tau:settings", description: "Open Tau Web settings (theme, display)", source: "tau", location: "builtin", capability: "execute", acceptsArgs: false, availableWhileStreaming: true },
+    { id: "tau:model", name: "model", invocation: "/tau:model", description: "Open Tau Web model picker", source: "tau", location: "builtin", capability: "execute", acceptsArgs: false, availableWhileStreaming: true },
+    { id: "tau:thinking", name: "thinking", invocation: "/tau:thinking", description: "Cycle Tau Web thinking level", source: "tau", location: "builtin", capability: "execute", acceptsArgs: false, availableWhileStreaming: true },
+    { id: "tau:compact", name: "compact", invocation: "/tau:compact", description: "Compact context to save tokens", source: "tau", location: "builtin", capability: "execute", acceptsArgs: false, availableWhileStreaming: false },
+    { id: "tau:export-html", name: "export-html", invocation: "/tau:export-html", description: "Export session as HTML file", source: "tau", location: "builtin", capability: "execute", acceptsArgs: false, availableWhileStreaming: true },
+    { id: "tau:session-stats", name: "session-stats", invocation: "/tau:session-stats", description: "Show session statistics", source: "tau", location: "builtin", capability: "execute", acceptsArgs: false, availableWhileStreaming: true },
+    { id: "tau:expand-tools", name: "expand-tools", invocation: "/tau:expand-tools", description: "Expand all tool cards", source: "tau", location: "builtin", capability: "execute", acceptsArgs: false, availableWhileStreaming: true },
+    { id: "tau:collapse-tools", name: "collapse-tools", invocation: "/tau:collapse-tools", description: "Collapse all tool cards", source: "tau", location: "builtin", capability: "execute", acceptsArgs: false, availableWhileStreaming: true },
+    { id: "tau:refresh-commands", name: "refresh-commands", invocation: "/tau:refresh-commands", description: "Refresh command list", source: "tau", location: "builtin", capability: "execute", acceptsArgs: false, availableWhileStreaming: true },
+    { id: "tau:toggle-cover", name: "toggle-cover", invocation: "/tau:toggle-cover", description: "Toggle session cover", source: "tau", location: "builtin", capability: "execute", acceptsArgs: false, availableWhileStreaming: true },
+    { id: "tau:scroll-start", name: "scroll-start", invocation: "/tau:scroll-start", description: "Scroll to session start", source: "tau", location: "builtin", capability: "execute", acceptsArgs: false, availableWhileStreaming: true },
+  ];
+
+  async function listAllCommands(refresh = false): Promise<{ commands: CommandDescriptor[]; adapter: ReturnType<PiCommandAdapter["info"]> }> {
+    if (!refresh && commandsCache && Date.now() - commandsCache.at < COMMANDS_TTL_MS) {
+      return { commands: commandsCache.commands, adapter: commandsCache.adapter };
+    }
+    refreshSessionCapture(latestCtx || undefined, pi as any);
+    let piCommands: CommandDescriptor[] = [];
+    try {
+      piCommands = await commandAdapter.list();
+    } catch (e) {
+      console.warn("[Mirror] Command discovery failed:", (e as Error).message);
+    }
+    // Merge: Tau actions first, then Pi (dedupe by invocation)
+    const seen = new Set<string>();
+    const merged: CommandDescriptor[] = [];
+    for (const c of [...TAU_ACTIONS, ...piCommands]) {
+      const key = c.invocation.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(c);
+    }
+    const adapter = commandAdapter.info();
+    commandsCache = { at: Date.now(), commands: merged, adapter };
+    return { commands: merged, adapter };
+  }
+
+  function invalidateCommands(reason: string) {
+    commandsCache = null;
+    broadcast({ type: "event", event: { type: "commands_changed", reason } });
+  }
+
+  async function getGitInfo(cwd: string): Promise<{ branch?: string; dirty?: boolean }> {
+    if (gitCache && Date.now() - gitCache.at < 60_000) {
+      return { branch: gitCache.branch, dirty: gitCache.dirty };
+    }
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => resolve({}), 500);
+      execFile("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd, timeout: 450 }, (err, stdout) => {
+        if (err) {
+          clearTimeout(timeout);
+          gitCache = { at: Date.now() };
+          resolve({});
+          return;
+        }
+        const branch = (stdout || "").trim() || undefined;
+        execFile("git", ["status", "--porcelain"], { cwd, timeout: 450 }, (err2, statusOut) => {
+          clearTimeout(timeout);
+          const dirty = err2 ? undefined : !!(statusOut || "").trim();
+          gitCache = { at: Date.now(), branch, dirty };
+          resolve({ branch, dirty });
+        });
+      });
+    });
+  }
+
+  async function buildSessionCover(ctx: ExtensionContext | null) {
+    const model = ctx?.model as any;
+    const usage = ctx?.getContextUsage?.() as any;
+    const cwd = ctx?.cwd || process.cwd();
+    const git = await getGitInfo(cwd);
+    let resourceCounts = { extensions: 0, prompts: 0, skills: 0 };
+    try {
+      const { commands } = await listAllCommands(false);
+      resourceCounts = {
+        extensions: commands.filter((c) => c.source === "extension").length,
+        prompts: commands.filter((c) => c.source === "prompt").length,
+        skills: commands.filter((c) => c.source === "skill").length,
+      };
+    } catch { /* ignore */ }
+
+    let tauVersion = "1.0.9";
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(STATIC_DIR, "..", "package.json"), "utf8"));
+      tauVersion = pkg.version || tauVersion;
+    } catch { /* ignore */ }
+
+    let piVersion: string | undefined;
+    try {
+      const { createRequire } = await import("node:module");
+      // jiti provides a usable base path via __filename when available
+      const base = typeof __filename !== "undefined" ? __filename : path.join(STATIC_DIR, "index.js");
+      const req = createRequire(base);
+      for (const name of ["@earendil-works/pi-coding-agent", "@mariozechner/pi-coding-agent"]) {
+        try {
+          const p = req.resolve(`${name}/package.json`);
+          piVersion = JSON.parse(fs.readFileSync(p, "utf8")).version;
+          break;
+        } catch { /* next */ }
+      }
+    } catch { /* ignore */ }
+
+    const tokens = usage?.tokens ?? usage?.input ?? usage?.total;
+    const contextWindow = usage?.contextWindow ?? usage?.context_window;
+    const percent =
+      tokens != null && contextWindow
+        ? Math.round((Number(tokens) / Number(contextWindow)) * 100)
+        : usage?.percent;
+
+    return {
+      sessionName: pi.getSessionName?.() || undefined,
+      cwd,
+      projectName: path.basename(cwd),
+      model: model
+        ? {
+            provider: model.provider,
+            id: model.id,
+            displayName: model.name || model.id,
+          }
+        : undefined,
+      thinkingLevel: pi.getThinkingLevel?.(),
+      contextUsage: {
+        tokens: tokens != null ? Number(tokens) : undefined,
+        contextWindow: contextWindow != null ? Number(contextWindow) : undefined,
+        percent: percent != null ? Number(percent) : undefined,
+      },
+      runtime: { piVersion, tauVersion },
+      git,
+      resources: resourceCounts,
+      generatedAt: Date.now(),
+    };
+  }
 
   // Pending RPC-style requests from browser (id -> resolver)
   const pendingRequests = new Map<string, (response: any) => void>();
@@ -281,6 +509,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("taustop", {
     description: "Stop the Tau mirror server",
     handler: async (_args, ctx) => {
+      armSessionSwitcher(ctx);
       if (!server) {
         ctx.ui.notify("Tau is not running", "warning");
         return;
@@ -295,6 +524,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("taustart", {
     description: "Start the Tau mirror server",
     handler: async (_args, ctx) => {
+      armSessionSwitcher(ctx);
       if (server) {
         ctx.ui.notify(`Tau is already running at ${mirrorUrl}`, "warning");
         return;
@@ -310,13 +540,22 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("tau", {
     description: "Open Tau web UI in browser",
     handler: async (_args, ctx) => {
+      armSessionSwitcher(ctx);
       if (!mirrorUrl) {
         ctx.ui.notify("Mirror server not running yet", "warning");
         return;
       }
-      const { exec } = require("node:child_process");
-      exec(`open "${mirrorUrl}"`);
-      ctx.ui.notify(`Opened ${mirrorUrl}`, "info");
+      // Prefer loopback for local open
+      const openUrl = mirrorUrl.replace(/^http:\/\/[^/]+/, (m) => {
+        try {
+          const u = new URL(mirrorUrl);
+          return `http://127.0.0.1:${u.port || PORT}`;
+        } catch {
+          return m;
+        }
+      });
+      openInBrowser(openUrl);
+      ctx.ui.notify(`Opened ${openUrl}`, "info");
     },
   });
 
@@ -329,9 +568,7 @@ export default function (pi: ExtensionAPI) {
       }
       const qrPageUrl = `${mirrorUrl}/api/qr`;
       ctx.ui.notify(`Tau: ${mirrorUrl}  •  QR: ${qrPageUrl}`, "info");
-      // Open in default browser
-      const { exec } = require("node:child_process");
-      exec(`open "${qrPageUrl}"`);
+      openInBrowser(qrPageUrl);
     },
   });
 
@@ -474,6 +711,17 @@ export default function (pi: ExtensionAPI) {
 
     // Context usage
     const contextUsage = ctx.getContextUsage();
+    refreshSessionCapture(ctx, pi as any);
+
+    let commands: CommandDescriptor[] = [];
+    let adapterInfo = commandAdapter.info();
+    try {
+      const listed = await listAllCommands(false);
+      commands = listed.commands;
+      adapterInfo = listed.adapter;
+    } catch { /* ignore */ }
+
+    const sessionCover = await buildSessionCover(ctx);
 
     return {
       type: "mirror_sync",
@@ -484,6 +732,9 @@ export default function (pi: ExtensionAPI) {
       sessionFile,
       isStreaming: !ctx.isIdle(),
       contextUsage,
+      commands,
+      sessionCover,
+      commandAdapter: adapterInfo,
     };
   }
 
@@ -571,6 +822,155 @@ export default function (pi: ExtensionAPI) {
         case "abort": {
           if (ctx) ctx.abort();
           sendTo(ws, success("abort"));
+          break;
+        }
+
+        // ─── Commands ───
+        case "get_commands": {
+          refreshSessionCapture(ctx || undefined, pi as any);
+          const listed = await listAllCommands(!!command.refresh);
+          sendTo(ws, success("get_commands", {
+            commands: listed.commands,
+            adapter: listed.adapter,
+          }));
+          break;
+        }
+
+        case "execute_command": {
+          const invocation = typeof command.invocation === "string" ? command.invocation.trim() : "";
+          if (!invocation.startsWith("/")) {
+            sendTo(ws, error("execute_command", "invocation must start with /"));
+            break;
+          }
+          if (invocation.length > 8192) {
+            sendTo(ws, error("execute_command", "invocation too long"));
+            break;
+          }
+
+          // Remote safety: require auth or explicit allow when not loopback client
+          const remoteAddr = (ws as any)._socket?.remoteAddress || "";
+          const isLocalClient =
+            !remoteAddr ||
+            remoteAddr === "127.0.0.1" ||
+            remoteAddr === "::1" ||
+            remoteAddr === "::ffff:127.0.0.1";
+          if (!isLocalClient && !authEnabled && !TAU_SETTINGS.allowRemoteCommandExecution) {
+            sendTo(ws, error("execute_command", "Remote command execution is disabled. Enable auth or allowRemoteCommandExecution."));
+            break;
+          }
+
+          // Tau-local actions only under /tau:* — never steal Pi slash names
+          if (invocation.startsWith("/tau:")) {
+            sendTo(ws, success("execute_command", {
+              accepted: true,
+              executionMode: "tau-action",
+              action: invocation.slice(5),
+            }));
+            break;
+          }
+
+          const cmdName = invocation.split(/\s+/)[0];
+          const { commands: reg } = await listAllCommands(false);
+          const base = cmdName.toLowerCase();
+          const found = reg.find((c) => c.invocation.toLowerCase() === base || `/${c.name}`.toLowerCase() === base);
+
+          // Known terminal-only (no Pi dispatch path)
+          if (found?.capability === "terminal-only" || base === "/hotkeys") {
+            sendTo(ws, success("execute_command", {
+              accepted: false,
+              executionMode: "terminal-only",
+              error: "This command can only run in the Pi terminal",
+            }));
+            break;
+          }
+
+          // Prefer Pi session.prompt / adapter for all other slash commands
+          // (including /settings, /model, /thinking, /compact when Pi owns them)
+          refreshSessionCapture(ctx || undefined, pi as any);
+          const result = await commandAdapter.execute(invocation, {
+            streamingBehavior: command.streamingBehavior,
+          });
+          if (result.accepted) {
+            sendTo(ws, success("execute_command", result));
+            break;
+          }
+
+          // If not in registry and adapter failed, still don't open Tau UI
+          if (!found) {
+            // Last attempt already failed — report clearly
+            sendTo(ws, {
+              type: "response",
+              command: "execute_command",
+              success: false,
+              id,
+              error: result.error || `Unknown or unexecutable command: ${cmdName}`,
+              data: result,
+            });
+            break;
+          }
+
+          if (found.capability === "insert-only" || found.capability === "unavailable") {
+            sendTo(ws, success("execute_command", {
+              accepted: false,
+              executionMode: found.capability,
+              error: result.error || "Current Pi version cannot dispatch this command from Tau",
+            }));
+            break;
+          }
+
+          sendTo(ws, {
+            type: "response",
+            command: "execute_command",
+            success: false,
+            id,
+            error: result.error || "Execution failed",
+            data: result,
+          });
+          break;
+        }
+
+        case "get_session_cover": {
+          const cover = await buildSessionCover(ctx);
+          sendTo(ws, success("get_session_cover", cover));
+          break;
+        }
+
+        case "shutdown": {
+          // Browser tab/window closed → stop mirror + exit Pi
+          sendTo(ws, success("shutdown", { shuttingDown: true }));
+          setTimeout(() => quitPiProcess(command.reason || "ws_shutdown"), 100);
+          break;
+        }
+
+        case "switch_session": {
+          // Live Pi session switch via ExtensionCommandContext.switchSession
+          // (absolute session file path — not limited to current cwd like TUI /resume UI)
+          const sessionFile = typeof command.sessionFile === "string" ? command.sessionFile : "";
+          if (!sessionFile) {
+            sendTo(ws, error("switch_session", "sessionFile required"));
+            break;
+          }
+          if (ctx && !ctx.isIdle()) {
+            sendTo(ws, error("switch_session", "Agent is busy — wait for the current turn to finish, then switch."));
+            break;
+          }
+          refreshSessionCapture(ctx || undefined, pi as any);
+          const result = await switchPiSession(sessionFile);
+          if (result.ok) {
+            // session_start will refresh mirror_sync for clients
+            sendTo(ws, success("switch_session", { sessionFile, switched: true }));
+            invalidateCommands("session_switch");
+            gitCache = null;
+          } else {
+            sendTo(ws, {
+              type: "response",
+              command: "switch_session",
+              success: false,
+              id,
+              error: result.error || "Switch failed",
+              data: result,
+            });
+          }
           break;
         }
 
@@ -809,8 +1209,14 @@ export default function (pi: ExtensionAPI) {
   function serveStaticFile(req: http.IncomingMessage, res: http.ServerResponse) {
     let urlPath = req.url || "/";
 
-    // Auth gate — exempt /api/health for monitoring
-    if (authEnabled && urlPath !== "/api/health" && !checkBasicAuth(req)) {
+    // Auth gate — exempt health + shutdown (beacon has no Basic Auth headers)
+    const barePath = (urlPath.split("?")[0] || "/");
+    if (
+      authEnabled &&
+      barePath !== "/api/health" &&
+      barePath !== "/api/shutdown" &&
+      !checkBasicAuth(req)
+    ) {
       sendAuthRequired(res);
       return;
     }
@@ -1054,6 +1460,28 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return;
     }
 
+    // Shutdown Tau + exit Pi process (triggered when Web UI tab/window closes)
+    if (urlPath === "/api/shutdown" && (req.method === "POST" || req.method === "GET")) {
+      let body = "";
+      req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+      req.on("end", () => {
+        let reason = "web_ui_closed";
+        try {
+          if (body) {
+            const parsed = JSON.parse(body);
+            if (parsed?.reason) reason = String(parsed.reason);
+          }
+        } catch { /* ignore */ }
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, shuttingDown: true, reason }));
+
+        // Delay so the HTTP response can flush
+        setTimeout(() => quitPiProcess(reason), 150);
+      });
+      return;
+    }
+
     // RPC proxy — handle via WebSocket command handler
     if (urlPath === "/api/rpc" && req.method === "POST") {
       let body = "";
@@ -1080,10 +1508,54 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return;
     }
 
-    // Session switch — in mirror mode, this is a no-op (session is controlled by TUI)
+    // Session switch — mirror mode: drive Pi switchSession (absolute path, any project dir)
     if (urlPath === "/api/sessions/switch" && req.method === "POST") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true, mirror: true, note: "Session switching is controlled by the TUI in mirror mode" }));
+      let body = "";
+      req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+      req.on("end", async () => {
+        try {
+          const { sessionFile } = JSON.parse(body || "{}");
+          if (!sessionFile || typeof sessionFile !== "string") {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "sessionFile required" }));
+            return;
+          }
+          if (latestCtx && !latestCtx.isIdle()) {
+            res.writeHead(409, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Agent is busy — finish the current turn first" }));
+            return;
+          }
+          refreshSessionCapture(latestCtx || undefined, pi as any);
+          // Warm command registry (helps capture runner after bind)
+          try { pi.getCommands?.(); } catch { /* ignore */ }
+
+          let result = await switchPiSession(sessionFile);
+
+          // If hooks not ready, ask user path via registered command once more after delay
+          if (!result.ok && /unavailable|hooks not ready|no-op/i.test(result.error || "")) {
+            await new Promise((r) => setTimeout(r, 400));
+            try { pi.getCommands?.(); } catch { /* ignore */ }
+            result = await switchPiSession(sessionFile);
+          }
+
+          if (!result.ok) {
+            res.writeHead(result.cancelled ? 409 : 500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              error: result.error || "Switch failed",
+              cancelled: result.cancelled,
+              hint: "In the Pi terminal run: /tau-switch   (arms the hook), then retry the sidebar click.",
+            }));
+            return;
+          }
+          invalidateCommands("session_switch");
+          gitCache = null;
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: true, mirror: true, switched: true, sessionFile }));
+        } catch (e: any) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: e?.message || String(e) }));
+        }
+      });
       return;
     }
 
@@ -1704,6 +2176,18 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       registerInstance(port, sessionFile, ctx.cwd || process.cwd());
 
       ctx.ui.notify(`Tau mirror: ${mirrorUrl}${tailscaleUrl ? `  •  Tailscale: ${tailscaleUrl}` : ""}  •  /qr for QR code`, "info");
+
+      // Auto-open browser once per process (prefer loopback to avoid firewall prompts)
+      if (TAU_AUTO_OPEN && !browserOpenedOnce) {
+        browserOpenedOnce = true;
+        const localUrl = `http://127.0.0.1:${port}`;
+        setTimeout(() => openInBrowser(localUrl), 350);
+        console.log(`[Mirror] Auto-opening browser: ${localUrl}`);
+      }
+
+      // Warm command cache + session capture
+      refreshSessionCapture(ctx, pi as any);
+      void listAllCommands(true);
     };
 
     tryListen(PORT);
@@ -1714,6 +2198,20 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   // ═══════════════════════════════════════
   pi.on("session_start", async (_event, ctx) => {
     latestCtx = ctx;
+    invalidateCommands("session_start");
+    gitCache = null;
+    refreshSessionCapture(ctx, pi as any);
+
+    // After interactive mode binds command context, capture switchSession for Web sidebar
+    const tryCaptureSwitcher = () => {
+      try {
+        pi.getCommands?.();
+        refreshSessionCapture(ctx, pi as any);
+      } catch { /* ignore */ }
+    };
+    tryCaptureSwitcher();
+    setTimeout(tryCaptureSwitcher, 300);
+    setTimeout(tryCaptureSwitcher, 1000);
 
     // Skip mirror startup in subagent child processes
     // (pi-subagents sets PI_SUBAGENT_CHILD=1; child processes loading Tau
@@ -1734,6 +2232,31 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   // ═══════════════════════════════════════
   // Cleanup on shutdown
   // ═══════════════════════════════════════
+  let quitting = false;
+  function quitPiProcess(reason: string) {
+    if (quitting) return;
+    quitting = true;
+    console.log(`[Mirror] Quitting Pi process (reason: ${reason})`);
+    try {
+      stopServer();
+    } catch { /* ignore */ }
+    try {
+      latestCtx?.ui?.notify?.("Tau Web closed — shutting down Pi…", "info");
+    } catch { /* ignore */ }
+    try {
+      // Prefer graceful extension shutdown when available
+      (latestCtx as any)?.shutdown?.();
+    } catch { /* ignore */ }
+    // Hard exit so the terminal Pi process actually terminates
+    setTimeout(() => {
+      try {
+        process.exit(0);
+      } catch {
+        process.kill(process.pid, "SIGTERM");
+      }
+    }, 250);
+  }
+
   pi.on("session_shutdown", async () => {
     stopServer();
     console.log("[Mirror] Server shut down");

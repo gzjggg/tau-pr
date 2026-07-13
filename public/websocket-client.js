@@ -136,8 +136,28 @@ export class WebSocketClient extends EventTarget {
       case 'mirror_sync':
         this.dispatchEvent(new CustomEvent('mirrorSync', { detail: message }));
         break;
+      case 'response':
+        this.dispatchEvent(new CustomEvent('rpcResponse', { detail: message }));
+        break;
       default:
         console.warn('[WS] Unknown message type:', message.type);
     }
+  }
+
+  getCommands(refresh = false) {
+    this.send({ type: 'get_commands', id: `gc-${Date.now()}`, refresh });
+  }
+
+  executeCommand(invocation, streamingBehavior) {
+    this.send({
+      type: 'execute_command',
+      id: `ex-${Date.now()}`,
+      invocation,
+      streamingBehavior,
+    });
+  }
+
+  getSessionCover() {
+    this.send({ type: 'get_session_cover', id: `sc-${Date.now()}` });
   }
 }

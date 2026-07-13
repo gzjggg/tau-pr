@@ -3,8 +3,13 @@
  */
 
 export class ToolCardRenderer {
-  constructor(container) {
+  /**
+   * @param {HTMLElement} container - message list
+   * @param {{ scrollRoot?: HTMLElement }} [options]
+   */
+  constructor(container, options = {}) {
     this.container = container;
+    this.scrollRoot = options.scrollRoot || null;
     this.toolCards = new Map(); // toolCallId -> element
   }
 
@@ -315,17 +320,25 @@ export class ToolCardRenderer {
     return div.innerHTML;
   }
 
-  scrollToBottom() {
-    if (this.container) {
-      const threshold = 100;
-      const isNear =
-        this.container.scrollHeight - this.container.scrollTop - this.container.clientHeight < threshold;
-      if (isNear) {
-        requestAnimationFrame(() => {
-          this.container.scrollTop = this.container.scrollHeight;
-        });
-      }
-    }
+  /**
+   * @param {HTMLElement} [scrollRoot] optional override; defaults to nearest .messages-scroll
+   */
+  scrollToBottom(scrollRoot) {
+    const el =
+      scrollRoot ||
+      this.scrollRoot ||
+      this.container?.closest?.('#messages-scroll') ||
+      this.container?.closest?.('.messages-scroll') ||
+      this.container;
+    if (!el) return;
+    const threshold = 120;
+    const isNear = el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
+    if (!isNear) return;
+    const jump = () => { el.scrollTop = el.scrollHeight; };
+    requestAnimationFrame(() => {
+      jump();
+      requestAnimationFrame(jump);
+    });
   }
 
   expandAll() {

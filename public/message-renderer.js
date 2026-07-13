@@ -5,16 +5,22 @@
 import { renderMarkdown, renderUserMarkdown } from './markdown.js';
 
 export class MessageRenderer {
-  constructor(container) {
+  /**
+   * @param {HTMLElement} container - message list (#messages)
+   * @param {{ scrollRoot?: HTMLElement }} [options] - actual overflow scroller (#messages-scroll)
+   */
+  constructor(container, options = {}) {
     this.container = container;
+    this.scrollRoot = options.scrollRoot || container;
     this.isNearBottom = true;
 
-    // Track scroll position for smart auto-scroll
-    this.container.addEventListener('scroll', () => {
-      const threshold = 100;
+    // Track scroll on the real scroll parent (not the flex child)
+    this.scrollRoot.addEventListener('scroll', () => {
+      const threshold = 120;
+      const el = this.scrollRoot;
       this.isNearBottom =
-        this.container.scrollHeight - this.container.scrollTop - this.container.clientHeight < threshold;
-    });
+        el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
+    }, { passive: true });
   }
 
   clear() {
@@ -60,8 +66,15 @@ export class MessageRenderer {
     const welcome = this.container.querySelector('.welcome');
     if (welcome) welcome.remove();
 
+    const raw = typeof message.content === 'string' ? message.content : '';
+    const slashInfo = parseSlashUserMessage(raw);
+
     const div = document.createElement('div');
-    div.className = `message user${isHistory ? ' history' : ''}`;
+    let extraClass = '';
+    if (slashInfo) {
+      extraClass = slashInfo.isSkill ? ' skill-cmd' : ' slash-cmd';
+    }
+    div.className = `message user${extraClass}${isHistory ? ' history' : ''}`;
 
     let imagesHtml = '';
     if (message.images && message.images.length > 0) {
@@ -73,8 +86,18 @@ export class MessageRenderer {
         '</div>';
     }
 
+    let bodyHtml;
+    if (slashInfo) {
+      const argsHtml = slashInfo.args
+        ? ` <span class="slash-cmd-args">${escapeHtmlText(slashInfo.args)}</span>`
+        : '';
+      bodyHtml = `<span class="slash-cmd-name">${escapeHtmlText(slashInfo.invocation)}</span>${argsHtml}`;
+    } else {
+      bodyHtml = renderUserMarkdown(message.content);
+    }
+
     div.innerHTML = `
-      <div class="message-content">${imagesHtml}${renderUserMarkdown(message.content)}</div>
+      <div class="message-content">${imagesHtml}${bodyHtml}</div>
       <button class="message-copy-btn" aria-label="Copy message"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
     `;
     this._setupCopyBtn(div);
@@ -277,11 +300,45 @@ export class MessageRenderer {
     return div.innerHTML;
   }
 
-  scrollToBottom() {
-    if (this.isNearBottom) {
-      requestAnimationFrame(() => {
-        this.container.scrollTop = this.container.scrollHeight;
-      });
-    }
+  scrollToBottom(force = false) {
+    if (!force && !this.isNearBottom) return;
+    const el = this.scrollRoot;
+    const jump = () => { el.scrollTop = el.scrollHeight; };
+    requestAnimationFrame(() => {
+      jump();
+      requestAnimationFrame(jump);
+    });
+    this.isNearBottom = true;
   }
+}
+
+/** Detect `/command` or `/skill:name` user invocations for accent styling */
+function parseSlashUserMessage(text) {
+  if (!text || typeof text !== 'string') return null;
+  const trimmed = text.trim();
+  // Single-line or first-line slash command
+  const firstLine = trimmed.split(/\n/)[0].trim();
+  const m = firstLine.match(/^(\/[\w.:-]+)(?:\s+([\s\S]*))?$/);
+  if (!m) return null;
+  // Only treat whole message as command if it's short / clearly a slash invoke
+  if (trimmed.includes('\n') && trimmed.length > 200) return null;
+  const invocation = m[1];
+  const args = (m[2] || '').trim();
+  // Skills: /skill:name or common skill entrypoints like /websearch
+  const isSkill =
+    invocation.startsWith('/skill:') ||
+    /^\/(websearch|web-search)$/i.test(invocation);
+  return {
+    invocation,
+    args: trimmed.includes('\n') ? trimmed.slice(invocation.length).trim() : args,
+    isSkill,
+  };
+}
+
+function escapeHtmlText(text) {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
