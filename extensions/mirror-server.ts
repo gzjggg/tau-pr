@@ -22,7 +22,6 @@ import {
   createPiCommandAdapter,
   refreshSessionCapture,
   resumeSessionLikeTui,
-  setSessionSwitcher,
   type CommandDescriptor,
   type PiCommandAdapter,
 } from "./pi-command-adapter";
@@ -279,44 +278,53 @@ export default function (pi: ExtensionAPI) {
   // Store latest context reference for use in command handlers
   let latestCtx: ExtensionContext | null = null;
 
-  /** Arm Web sidebar session switch from any ExtensionCommandContext */
+  /**
+   * Arm sidebar resume. NEVER close over ExtensionCommandContext — it goes stale
+   * after switchSession. Prefer interactive bind capture inside resumeSessionLikeTui.
+   */
   function armSessionSwitcher(ctx: { switchSession: (p: string, o?: any) => Promise<any> }) {
-    if (typeof ctx?.switchSession === "function") {
-      setSessionSwitcher((sessionPath, options) => ctx.switchSession(sessionPath, options));
-      console.log("[Mirror] Session switcher armed from command context");
-    }
+    // Warm capture patches (bindCommandContext / runner) without storing this ctx
+    try {
+      refreshSessionCapture(ctx as any, pi as any);
+      pi.getCommands?.();
+    } catch { /* ignore */ }
+    console.log("[Mirror] Resume hooks warmed (no closed-over ctx)");
   }
 
-  // Same code path as TUI /resume after you pick a session (ctx.switchSession → handleResumeSession).
-  // Args: absolute path to session .jsonl (or quoted path). No args = arm the hook only.
+  // Args: absolute path to session .jsonl. No args = warm hooks only.
   pi.registerCommand("tau-switch", {
     description:
       "Resume a session like TUI /resume (pick). Args: absolute session .jsonl path. Used by Tau Web sidebar.",
     handler: async (args, ctx) => {
       armSessionSwitcher(ctx);
       const target = (args || "").trim().replace(/^["']|["']$/g, "");
+      // Notify BEFORE switch — after switch this ctx is invalid
       if (!target) {
-        ctx.ui.notify("Tau resume hook ready — sidebar can resume same-cwd sessions", "info");
+        try {
+          ctx.ui.notify("Tau resume hook ready — sidebar can resume same-cwd sessions", "info");
+        } catch { /* ignore */ }
         return;
       }
+      const liveCwd = (ctx as any).cwd || process.cwd();
       try {
-        // Prefer shared safe helper (cwd preflight + process.exit guard)
         const result = await resumeSessionLikeTui(target, {
           requireSameCwd: true,
-          liveCwd: (ctx as any).cwd || process.cwd(),
+          liveCwd,
+          onNewSession: (newCtx) => {
+            latestCtx = newCtx;
+          },
         });
+        // Do NOT touch `ctx` after resume — it is stale. Use latestCtx / console only.
         if (result.cancelled) {
-          ctx.ui.notify("Session resume cancelled", "warning");
+          console.warn("[Tau] /tau-switch cancelled");
           return;
         }
         if (!result.ok) {
-          ctx.ui.notify(result.error || "Resume failed", "error");
+          console.warn("[Tau] /tau-switch failed:", result.error);
           return;
         }
-        ctx.ui.notify("Resumed session (like /resume)", "info");
+        console.log("[Tau] /tau-switch ok", result.newSessionFile || target);
       } catch (e: any) {
-        // Never rethrow — uncaught errors can tear down interactive mode
-        ctx.ui.notify(`Resume failed: ${e?.message || e}`, "error");
         console.warn("[Tau] /tau-switch error:", e);
       }
     },
@@ -964,27 +972,39 @@ export default function (pi: ExtensionAPI) {
             sendTo(ws, error("switch_session", "sessionFile required"));
             break;
           }
-          if (ctx && !ctx.isIdle()) {
+          // Read idle/cwd from latestCtx carefully — the WS `ctx` may already be stale mid-handler
+          let busy = false;
+          let liveCwd = process.cwd();
+          try {
+            busy = !!(latestCtx && !latestCtx.isIdle());
+            liveCwd = (latestCtx as any)?.cwd || process.cwd();
+          } catch { /* ignore */ }
+          if (busy) {
             sendTo(ws, error("switch_session", "Agent is busy — finish the current turn first"));
             break;
           }
-          refreshSessionCapture(ctx || undefined, pi as any);
+          refreshSessionCapture(undefined, pi as any);
           const result = await resumeSessionLikeTui(sessionFile, {
             requireSameCwd: true,
-            liveCwd: (ctx as any)?.cwd || process.cwd(),
+            liveCwd,
+            onNewSession: (newCtx) => { latestCtx = newCtx; },
           });
-          if (result.ok) {
+          if (result.ok || result.recovered) {
             invalidateCommands("session_switch");
             gitCache = null;
-            try {
-              if (latestCtx) {
-                const snapshot = await buildStateSnapshot(latestCtx);
-                broadcast(snapshot);
-              }
-            } catch { /* ignore */ }
+            // Snapshot comes from session_start; do not use pre-switch ctx
+            sendTo(ws, success("switch_session", {
+              sessionFile: result.newSessionFile || sessionFile,
+              switched: true,
+              recovered: !!result.recovered,
+              mode: "resume-like-tui",
+            }));
+          } else if (/stale/i.test(result.error || "")) {
+            // TUI already switched
             sendTo(ws, success("switch_session", {
               sessionFile,
               switched: true,
+              recovered: true,
               mode: "resume-like-tui",
             }));
           } else {
@@ -1589,24 +1609,50 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
             res.end(JSON.stringify({ error: "Agent is busy — finish the current turn first" }));
             return;
           }
+          const preCwd = (latestCtx as any)?.cwd || process.cwd();
+          // Snapshot pre-switch file only (string) — do not hold latestCtx across await
+          const preFile = (() => {
+            try {
+              return latestCtx?.sessionManager?.getSessionFile?.() || "";
+            } catch {
+              return "";
+            }
+          })();
+
           refreshSessionCapture(latestCtx || undefined, pi as any);
           try { pi.getCommands?.(); } catch { /* ignore */ }
 
           let result = await resumeSessionLikeTui(sessionFile, {
             requireSameCwd: true,
-            liveCwd: (latestCtx as any)?.cwd || process.cwd(),
+            liveCwd: preCwd,
+            onNewSession: (newCtx) => {
+              // ONLY place it is safe to assign post-switch context
+              latestCtx = newCtx;
+            },
           });
 
-          // Soft success: if live session already points at the target (resume partially worked)
-          await new Promise((r) => setTimeout(r, 250));
-          const liveNow = latestCtx?.sessionManager?.getSessionFile?.() || "";
+          // Give session_start a moment to also update latestCtx + broadcast
+          await new Promise((r) => setTimeout(r, 300));
+
+          // Soft success if we recovered from stale-ctx or live file moved
+          let liveNow = "";
+          try {
+            liveNow = latestCtx?.sessionManager?.getSessionFile?.() || result.newSessionFile || "";
+          } catch {
+            liveNow = result.newSessionFile || "";
+          }
           if (!result.ok && liveNow) {
             try {
               if (path.resolve(liveNow).toLowerCase() === path.resolve(sessionFile).toLowerCase()) {
-                console.log("[Mirror] Resume reported fail but live session matches — treating as success");
-                result = { ok: true, sessionCwd: result.sessionCwd };
+                console.log("[Mirror] Resume reported fail but live session matches — success");
+                result = { ...result, ok: true, recovered: true };
               }
             } catch { /* ignore */ }
+          }
+          // Also soft-success if TUI moved off preFile (switch happened)
+          if (!result.ok && liveNow && preFile && path.resolve(liveNow).toLowerCase() !== path.resolve(preFile).toLowerCase()) {
+            console.log("[Mirror] Live session file changed — treating resume as success");
+            result = { ...result, ok: true, recovered: true };
           }
 
           if (!result.ok) {
@@ -1615,38 +1661,75 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
               error: result.error || "Resume failed",
               cancelled: result.cancelled,
               readonly: true,
-              hint: result.error?.includes("another directory")
-                ? "Other-directory sessions are history-only in Tau. Use /resume in the Pi terminal for cross-cwd."
-                : "Run /tau-switch once in the terminal to arm the hook, then retry.",
+              hint: /stale/i.test(result.error || "")
+                ? "Session likely resumed in TUI; refresh Tau. Run /tau-switch once if sidebar resume stays broken."
+                : result.error?.includes("another directory")
+                  ? "Other-directory sessions are history-only in Tau. Use /resume in the Pi terminal for cross-cwd."
+                  : "Run /tau-switch once in the terminal to arm the hook, then retry.",
             }));
             return;
           }
 
-          // Let session_start rebind, then push snapshot
           invalidateCommands("session_switch");
           gitCache = null;
+
+          // Prefer snapshot already broadcast by session_start. Optionally re-broadcast
+          // using latestCtx only if it was updated via withSession / session_start.
           try {
             if (latestCtx) {
-              const liveFile = latestCtx.sessionManager?.getSessionFile?.() || sessionFile;
+              const liveFile =
+                (() => {
+                  try {
+                    return latestCtx.sessionManager?.getSessionFile?.() || sessionFile;
+                  } catch {
+                    return sessionFile;
+                  }
+                })();
               updateInstanceSession(liveFile, (latestCtx as any).cwd || process.cwd());
-              const snapshot = await buildStateSnapshot(latestCtx);
-              broadcast(snapshot);
+              // session_start usually already broadcast; skip if still mid-rebind
+              try {
+                const snapshot = await buildStateSnapshot(latestCtx);
+                broadcast(snapshot);
+              } catch (e) {
+                console.warn("[Mirror] post-resume snapshot skipped (ctx may still rebind):", e);
+              }
             }
           } catch (e) {
-            console.warn("[Mirror] post-resume snapshot failed:", e);
+            console.warn("[Mirror] post-resume update skipped:", e);
           }
+
+          let outFile = sessionFile;
+          let outCwd = preCwd;
+          try {
+            outFile = latestCtx?.sessionManager?.getSessionFile?.() || result.newSessionFile || sessionFile;
+            outCwd = (latestCtx as any)?.cwd || preCwd;
+          } catch { /* use defaults */ }
 
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({
             success: true,
             mode: "resume-like-tui",
-            sessionFile: latestCtx?.sessionManager?.getSessionFile?.() || sessionFile,
-            cwd: (latestCtx as any)?.cwd || process.cwd(),
+            recovered: !!result.recovered,
+            sessionFile: outFile,
+            cwd: outCwd,
           }));
         } catch (e: any) {
           console.error("[Mirror] /api/sessions/resume error:", e);
+          // If error is stale-ctx, TUI likely already switched — tell client to sync
+          const msg = e?.message || String(e);
+          if (/stale after session replacement|ctx is stale/i.test(msg)) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              success: true,
+              recovered: true,
+              mode: "resume-like-tui",
+              sessionFile,
+              message: "TUI resumed; GUI should mirror_sync",
+            }));
+            return;
+          }
           res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: e?.message || String(e) }));
+          res.end(JSON.stringify({ error: msg }));
         }
       });
       return;
@@ -2299,11 +2382,12 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     gitCache = null;
     refreshSessionCapture(ctx, pi as any);
 
-    // After interactive mode binds command context, capture switchSession for Web sidebar
+    // Warm interactive bind capture (do not close over this session's ExtensionContext)
     const tryCaptureSwitcher = () => {
       try {
         pi.getCommands?.();
-        refreshSessionCapture(ctx, pi as any);
+        // refresh only — bindCommandContext patch stores interactive switchSession
+        refreshSessionCapture(undefined, pi as any);
       } catch { /* ignore */ }
     };
     tryCaptureSwitcher();

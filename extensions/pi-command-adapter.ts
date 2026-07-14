@@ -162,34 +162,29 @@ function tryPatchInternals(): void {
                 return origGet.apply(this, args);
               };
             }
-            // Capture real switchSession from interactive mode bind
+            // Capture interactive-mode switchSession (handleResumeSession) — stable across
+            // session replacement. NEVER capture ExtensionCommandContext.switchSession;
+            // those ctx objects are invalidated after switch ("stale after session replacement").
             const origBind = ER.prototype.bindCommandContext;
             if (typeof origBind === "function") {
               ER.prototype.bindCommandContext = function (this: any, actions: any) {
                 const result = origBind.call(this, actions);
                 capturedRunner = this;
                 if (actions?.switchSession) {
+                  const liveSwitch = actions.switchSession.bind(actions);
                   capturedSwitchSession = (sessionPath: string, options?: any) =>
-                    actions.switchSession(sessionPath, options);
-                  console.log("[Tau] Captured live switchSession handler");
+                    liveSwitch(sessionPath, options);
+                  console.log("[Tau] Captured interactive switchSession (handleResumeSession)");
                 }
                 return result;
               };
             }
-            // Also capture via createCommandContext calls
+            // Only remember the runner — do NOT close over returned ExtensionCommandContext
             const origCreate = ER.prototype.createCommandContext;
             if (typeof origCreate === "function") {
               ER.prototype.createCommandContext = function (this: any, ...args: any[]) {
                 capturedRunner = this;
-                const ctx = origCreate.apply(this, args);
-                if (ctx && typeof ctx.switchSession === "function" && this.switchSessionHandler) {
-                  // Prefer bound handler on runner if not the noop
-                  const h = this.switchSessionHandler;
-                  if (h && !String(h).includes("cancelled: false") || true) {
-                    capturedSwitchSession = (p: string, o?: any) => ctx.switchSession(p, o);
-                  }
-                }
-                return ctx;
+                return origCreate.apply(this, args);
               };
             }
             ER.prototype.__tauCapture = true;
@@ -205,9 +200,12 @@ function tryPatchInternals(): void {
           const RT = mod.AgentSessionRuntime;
           if (RT?.prototype?.switchSession && !RT.prototype.__tauCapture) {
             const orig = RT.prototype.switchSession;
+            // Prefer interactive bind when available; runtime method as fallback only
             RT.prototype.switchSession = function (this: any, ...args: any[]) {
-              // Keep a direct runtime switch fallback
-              capturedSwitchSession = (p: string, o?: any) => orig.call(this, p, o);
+              if (!capturedSwitchSession) {
+                const runtime = this;
+                capturedSwitchSession = (p: string, o?: any) => orig.call(runtime, p, o);
+              }
               return orig.apply(this, args);
             };
             RT.prototype.__tauCapture = true;
@@ -222,11 +220,18 @@ function tryPatchInternals(): void {
   }
 }
 
-/** Called from mirror-server with ExtensionCommandContext when available */
+/**
+ * Install a resume switcher. Prefer installFreshSessionSwitcher() —
+ * never pass a closure that holds a single ExtensionCommandContext.
+ */
 export function setSessionSwitcher(
   fn: (sessionPath: string, options?: any) => Promise<{ cancelled?: boolean }>
 ): void {
   capturedSwitchSession = fn;
+}
+
+export function clearSessionSwitcher(): void {
+  capturedSwitchSession = null;
 }
 
 function mapScope(scope?: string): CommandLocation {
@@ -621,14 +626,28 @@ async function withBlockedProcessExit<T>(fn: () => Promise<T>): Promise<T> {
 
 /**
  * Resume a session the same way TUI /resume does after you pick a row:
- * ExtensionCommandContext.switchSession(absolutePath) → interactive handleResumeSession.
+ * Fresh createCommandContext().switchSession(path, { withSession }) → handleResumeSession.
  *
- * Only call for sessions whose cwd exists (and preferably matches process.cwd()).
+ * CRITICAL: never close over an ExtensionCommandContext across switches — after
+ * switchSession the old ctx is invalidated ("stale after session replacement").
+ * Always createCommandContext() at call time and do post-work only in withSession.
  */
 export async function resumeSessionLikeTui(
   sessionFile: string,
-  options?: { requireSameCwd?: boolean; liveCwd?: string }
-): Promise<{ ok: boolean; cancelled?: boolean; error?: string; sessionCwd?: string | null }> {
+  options?: {
+    requireSameCwd?: boolean;
+    liveCwd?: string;
+    /** Called with the NEW session ctx after replacement (safe to use) */
+    onNewSession?: (newCtx: any) => void | Promise<void>;
+  }
+): Promise<{
+  ok: boolean;
+  cancelled?: boolean;
+  error?: string;
+  sessionCwd?: string | null;
+  recovered?: boolean;
+  newSessionFile?: string | null;
+}> {
   tryPatchInternals();
   refreshSessionCapture();
 
@@ -661,50 +680,75 @@ export async function resumeSessionLikeTui(
     }
   }
 
-  // Prefer armed interactive switchSession (handleResumeSession) — same as picking in /resume UI
-  const attempts: Array<() => Promise<{ cancelled?: boolean } | void>> = [];
-  if (capturedSwitchSession) {
-    attempts.push(() => capturedSwitchSession!(resolved));
-  }
-  if (capturedRunner && typeof capturedRunner.createCommandContext === "function") {
-    attempts.push(async () => {
+  // Resolve switcher at CALL time — never close over one ExtensionCommandContext.
+  // Priority: interactive handleResumeSession (bindCommandContext) > fresh createCommandContext.
+  const runSwitch = async (p: string, o?: any) => {
+    refreshSessionCapture();
+    if (capturedSwitchSession) {
+      return capturedSwitchSession(p, o);
+    }
+    if (capturedRunner && typeof capturedRunner.createCommandContext === "function") {
       const cmdCtx = capturedRunner.createCommandContext();
-      if (typeof cmdCtx.switchSession !== "function") {
-        throw new Error("createCommandContext().switchSession missing");
-      }
-      return cmdCtx.switchSession(resolved);
-    });
-  }
-  if (capturedSession?.extensionRunner?.createCommandContext) {
-    attempts.push(async () => {
-      const cmdCtx = capturedSession.extensionRunner.createCommandContext();
-      return cmdCtx.switchSession(resolved);
-    });
-  }
+      return cmdCtx.switchSession(p, o);
+    }
+    const runner = capturedSession?.extensionRunner;
+    if (runner?.createCommandContext) {
+      const cmdCtx = runner.createCommandContext();
+      return cmdCtx.switchSession(p, o);
+    }
+    throw new Error(
+      "Resume hook not ready. In the Pi terminal run: /tau-switch   (no args) once, then retry from Tau."
+    );
+  };
 
-  if (!attempts.length) {
-    return {
-      ok: false,
-      error:
-        "Resume hook not ready. In the Pi terminal run: /tau-switch   (no args) once, then retry from Tau.",
-      sessionCwd,
-    };
-  }
-
+  let newSessionFile: string | null = null;
   try {
-    const result = await withBlockedProcessExit(() => attempts[0]!());
+    const result = await withBlockedProcessExit(async () => {
+      return runSwitch(resolved, {
+        withSession: async (newCtx: any) => {
+          try {
+            newSessionFile =
+              newCtx?.sessionManager?.getSessionFile?.() ||
+              newCtx?.sessionFile ||
+              resolved;
+            if (options?.onNewSession) {
+              await options.onNewSession(newCtx);
+            }
+          } catch (e) {
+            // Post-switch work must never fail the resume itself
+            console.warn("[Tau] withSession callback error (ignored):", e);
+          }
+        },
+      });
+    });
+
     if (result && (result as any).cancelled) {
       return { ok: false, cancelled: true, error: "Session resume cancelled", sessionCwd };
     }
     console.log("[Tau] resume (like /resume pick) ok →", resolved);
-    return { ok: true, sessionCwd };
+    return { ok: true, sessionCwd, newSessionFile };
   } catch (e) {
     const lastError = e instanceof Error ? e.message : String(e);
-    console.warn("[Tau] resume failed:", lastError);
-    if (/already|same session|no.?op|not modified/i.test(lastError)) {
-      return { ok: true, sessionCwd };
+    console.warn("[Tau] resume threw:", lastError);
+
+    // Switch often already completed; Pi then invalidates the pre-switch ctx.
+    // Treat classic "stale after session replacement" as soft success.
+    if (/stale after session replacement|stale after session|ctx is stale/i.test(lastError)) {
+      console.log("[Tau] stale-ctx after switch — treating as success (TUI already resumed)");
+      return {
+        ok: true,
+        recovered: true,
+        sessionCwd,
+        newSessionFile: newSessionFile || resolved,
+      };
     }
-    return { ok: false, error: lastError, sessionCwd };
+    if (/already|same session|no.?op|not modified/i.test(lastError)) {
+      return { ok: true, sessionCwd, newSessionFile: newSessionFile || resolved };
+    }
+    if (/Resume hook not ready/i.test(lastError)) {
+      return { ok: false, error: lastError, sessionCwd };
+    }
+    return { ok: false, error: lastError, sessionCwd, newSessionFile };
   }
 }
 

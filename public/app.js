@@ -1495,9 +1495,11 @@ async function switchSession(sessionFile, session = null, project = null) {
             viewingActiveSession = true;
             updateMirrorInputState();
             sidebar.setActive(mirrorActiveSessionFile);
-            statusText.textContent = 'Session resumed';
+            statusText.textContent = result.data?.recovered
+              ? 'Session resumed (recovered)'
+              : 'Session resumed';
             setTimeout(() => { statusText.textContent = 'Connected'; }, 1500);
-            // Prefer live snapshot; if UI stays empty, paint history from disk
+            // Live snapshot from session_start; request again as safety net
             setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 200);
             setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 700);
             setTimeout(async () => {
@@ -1513,7 +1515,30 @@ async function switchSession(sessionFile, session = null, project = null) {
             }, 1200);
             return;
           }
-          // Fall back to history if resume refused (hook not ready, etc.)
+
+          // Stale-ctx errors often mean TUI already switched — treat as live + sync
+          if (/stale after session replacement|ctx is stale/i.test(result.error || '')) {
+            console.warn('[App] Resume reported stale-ctx — assuming TUI switched, syncing GUI');
+            mirrorActiveSessionFile = sessionFile;
+            viewingActiveSession = true;
+            updateMirrorInputState();
+            sidebar.setActive(sessionFile);
+            statusText.textContent = 'Syncing after resume…';
+            setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 200);
+            setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 800);
+            setTimeout(async () => {
+              const empty = !messagesEl.querySelector(
+                '.message, .tool-card, .thinking-block, .session-cover'
+              );
+              if (empty) await loadSessionHistory(session, project);
+              viewingActiveSession = true;
+              updateMirrorInputState();
+              statusText.textContent = 'Connected';
+            }, 1400);
+            return;
+          }
+
+          // Fall back to history if resume refused
           console.warn('[App] Resume-like failed:', result.error);
           await openSessionReadOnly(
             session,
