@@ -561,12 +561,74 @@ export function refreshSessionCapture(ctx?: { getContextUsage?: () => unknown },
   } catch { /* ignore */ }
 }
 
+/** Read cwd from a Pi session .jsonl (first `type:"session"` entry). */
+export function readSessionCwd(sessionFile: string): string | null {
+  try {
+    const fd = fs.openSync(sessionFile, "r");
+    try {
+      const buf = Buffer.alloc(64 * 1024);
+      const n = fs.readSync(fd, buf, 0, buf.length, 0);
+      const text = buf.slice(0, n).toString("utf8");
+      for (const line of text.split(/\r?\n/)) {
+        if (!line.trim()) continue;
+        try {
+          const row = JSON.parse(line);
+          if (row?.type === "session" && typeof row.cwd === "string" && row.cwd) {
+            return row.cwd;
+          }
+          if (typeof row?.cwd === "string" && row.cwd) return row.cwd;
+        } catch {
+          /* next line */
+        }
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+function normalizePathKey(p: string): string {
+  return p
+    .trim()
+    .replace(/^\\\\\?\\/, "")
+    .replace(/\\/g, "/")
+    .replace(/\/+/g, "/")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+}
+
 /**
- * Switch the live Pi session to an absolute session file path.
- * Uses ExtensionCommandContext.switchSession (not limited to cwd like TUI /resume picker).
- * Cross-project sessions work when the session file exists on disk.
+ * Block process.exit during resume — Pi's handleResumeSession calls
+ * handleFatalRuntimeError → process.exit(1) on non-cwd failures, which kills TUI.
  */
-export async function switchPiSession(sessionFile: string): Promise<{ ok: boolean; cancelled?: boolean; error?: string }> {
+async function withBlockedProcessExit<T>(fn: () => Promise<T>): Promise<T> {
+  const realExit = process.exit.bind(process);
+  let blockedExitCode: number | null = null;
+  (process as any).exit = (code?: number) => {
+    blockedExitCode = code ?? 0;
+    console.warn(`[Tau] Blocked process.exit(${blockedExitCode}) during session resume`);
+    throw new Error(`Session resume failed (Pi tried to exit with code ${blockedExitCode})`);
+  };
+  try {
+    return await fn();
+  } finally {
+    process.exit = realExit as typeof process.exit;
+  }
+}
+
+/**
+ * Resume a session the same way TUI /resume does after you pick a row:
+ * ExtensionCommandContext.switchSession(absolutePath) → interactive handleResumeSession.
+ *
+ * Only call for sessions whose cwd exists (and preferably matches process.cwd()).
+ */
+export async function resumeSessionLikeTui(
+  sessionFile: string,
+  options?: { requireSameCwd?: boolean; liveCwd?: string }
+): Promise<{ ok: boolean; cancelled?: boolean; error?: string; sessionCwd?: string | null }> {
   tryPatchInternals();
   refreshSessionCapture();
 
@@ -574,18 +636,36 @@ export async function switchPiSession(sessionFile: string): Promise<{ ok: boolea
     return { ok: false, error: "sessionFile required" };
   }
 
-  // Normalize path for Windows
   const resolved = path.resolve(sessionFile);
   if (!fs.existsSync(resolved)) {
     return { ok: false, error: `Session file not found: ${resolved}` };
   }
 
-  const attempts: Array<() => Promise<{ cancelled?: boolean } | void>> = [];
+  const sessionCwd = readSessionCwd(resolved);
+  if (sessionCwd && !fs.existsSync(sessionCwd)) {
+    return {
+      ok: false,
+      error: `Session cwd does not exist: ${sessionCwd}. Open history read-only, or resume in TUI with /resume.`,
+      sessionCwd,
+    };
+  }
 
+  const liveCwd = options?.liveCwd || process.cwd();
+  if (options?.requireSameCwd !== false && sessionCwd) {
+    if (normalizePathKey(sessionCwd) !== normalizePathKey(liveCwd)) {
+      return {
+        ok: false,
+        error: `Session is under another directory (${sessionCwd}). Live resume only for current cwd; use history browse or TUI /resume.`,
+        sessionCwd,
+      };
+    }
+  }
+
+  // Prefer armed interactive switchSession (handleResumeSession) — same as picking in /resume UI
+  const attempts: Array<() => Promise<{ cancelled?: boolean } | void>> = [];
   if (capturedSwitchSession) {
     attempts.push(() => capturedSwitchSession!(resolved));
   }
-
   if (capturedRunner && typeof capturedRunner.createCommandContext === "function") {
     attempts.push(async () => {
       const cmdCtx = capturedRunner.createCommandContext();
@@ -595,7 +675,6 @@ export async function switchPiSession(sessionFile: string): Promise<{ ok: boolea
       return cmdCtx.switchSession(resolved);
     });
   }
-
   if (capturedSession?.extensionRunner?.createCommandContext) {
     attempts.push(async () => {
       const cmdCtx = capturedSession.extensionRunner.createCommandContext();
@@ -603,43 +682,35 @@ export async function switchPiSession(sessionFile: string): Promise<{ ok: boolea
     });
   }
 
-  // Last resort: call runner.switchSessionHandler directly if present
-  if (capturedRunner?.switchSessionHandler) {
-    attempts.push(() => capturedRunner.switchSessionHandler(resolved));
-  }
-
   if (!attempts.length) {
     return {
       ok: false,
       error:
-        "Pi switchSession is unavailable (hooks not ready). Wait a moment after Pi starts, or use terminal /resume. Check console for [Tau] hook logs.",
+        "Resume hook not ready. In the Pi terminal run: /tau-switch   (no args) once, then retry from Tau.",
+      sessionCwd,
     };
   }
 
-  // Only try handlers until one succeeds. Do NOT chain multiple switchSession
-  // calls — a partial success + second attempt can desync TUI vs HTTP response.
-  let lastError = "unknown";
-  for (const attempt of attempts) {
-    try {
-      const result = await attempt();
-      if (result && (result as any).cancelled) {
-        return { ok: false, cancelled: true, error: "Session switch cancelled" };
-      }
-      console.log("[Tau] switchSession ok →", resolved);
-      return { ok: true };
-    } catch (e) {
-      lastError = e instanceof Error ? e.message : String(e);
-      console.warn("[Tau] switchSession attempt failed:", lastError);
-      // If the error looks like "already switched" / path, treat as soft success
-      if (/already|same session|no.?op|not modified/i.test(lastError)) {
-        return { ok: true };
-      }
-      // One failure → stop (do not call switchSession again)
-      break;
+  try {
+    const result = await withBlockedProcessExit(() => attempts[0]!());
+    if (result && (result as any).cancelled) {
+      return { ok: false, cancelled: true, error: "Session resume cancelled", sessionCwd };
     }
+    console.log("[Tau] resume (like /resume pick) ok →", resolved);
+    return { ok: true, sessionCwd };
+  } catch (e) {
+    const lastError = e instanceof Error ? e.message : String(e);
+    console.warn("[Tau] resume failed:", lastError);
+    if (/already|same session|no.?op|not modified/i.test(lastError)) {
+      return { ok: true, sessionCwd };
+    }
+    return { ok: false, error: lastError, sessionCwd };
   }
+}
 
-  return { ok: false, error: lastError };
+/** @deprecated use resumeSessionLikeTui */
+export async function switchPiSession(sessionFile: string) {
+  return resumeSessionLikeTui(sessionFile, { requireSameCwd: false });
 }
 
 export { TUI_BUILTINS };

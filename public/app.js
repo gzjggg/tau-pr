@@ -1372,14 +1372,9 @@ async function handleSessionSelect(session, project) {
 /**
  * Sidebar session selection.
  *
- * IMPORTANT: Never call Pi switchSession from the browser.
- * Programmatic switchSession loads extensions (memctx, hephaestus, …) in a
- * non-TUI context and has been observed to tear down the entire Pi process.
- *
- * Strategy:
- * 1. Clicking the *live* session → re-sync mirror snapshot
- * 2. Any other session → read-only history browse (same or other cwd)
- * 3. Live session changes only via the Pi TUI (/resume) — GUI follows automatically
+ * Same-cwd: map to TUI /resume pick path via POST /api/sessions/resume
+ *   (server runs /tau-switch → ctx.switchSession = handleResumeSession).
+ * Other cwd: history read-only only (avoids missing-cwd fatal exit).
  */
 function sessionBelongsToLiveCwd(project, sessionFile) {
   if (sessionFile && sessionFile === mirrorActiveSessionFile) return true;
@@ -1395,6 +1390,10 @@ function sessionFilesEqual(a, b) {
   return pathsEqual(a, b);
 }
 
+function sessionLabel(session) {
+  return session?.name || session?.firstMessage || session?.file || 'session';
+}
+
 async function openSessionReadOnly(session, project, notice) {
   viewingActiveSession = false;
   updateMirrorInputState();
@@ -1406,13 +1405,26 @@ async function openSessionReadOnly(session, project, notice) {
   if (notice) messageRenderer.renderSystemMessage(notice);
 }
 
+/** Resume live session the same way as TUI /resume after picking a row */
+async function resumeLikeTui(sessionFile) {
+  const res = await fetch('/api/sessions/resume', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessionFile }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok && data.success) {
+    return { ok: true, data };
+  }
+  return { ok: false, error: data.error || `HTTP ${res.status}`, data };
+}
+
 async function switchSession(sessionFile, session = null, project = null) {
   try {
     currentStreamingElement = null;
     currentStreamingThinking = '';
     currentStreamingText = '';
 
-    // New session (null) — never invent one from the web UI in mirror mode
     if (!sessionFile) {
       if (isMirrorMode) {
         messageRenderer.renderSystemMessage('Use the Pi terminal to start a new session in mirror mode.');
@@ -1429,7 +1441,7 @@ async function switchSession(sessionFile, session = null, project = null) {
     }
 
     if (isMirrorMode) {
-      // Already viewing the live session → soft re-sync only
+      // Already live → soft re-sync
       if (sessionFilesEqual(sessionFile, mirrorActiveSessionFile)) {
         viewingActiveSession = true;
         updateMirrorInputState();
@@ -1443,14 +1455,13 @@ async function switchSession(sessionFile, session = null, project = null) {
         return;
       }
 
-      // Another Tau instance already owns that session → reconnect only (no Pi switch)
+      // Other live Tau instance
       const otherInstance = liveInstances.find(
         (i) => i.sessionFile === sessionFile && i.port !== Number(new URL(wsClient.url).port)
       );
       if (otherInstance) {
         const protocol = document.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const newUrl = `${protocol}//${location.hostname}:${otherInstance.port}/ws`;
-        console.log(`[App] Reconnecting to instance on port ${otherInstance.port}`);
         wsClient.disconnect();
         wsClient.url = newUrl;
         wsClient.forceReconnect();
@@ -1464,16 +1475,61 @@ async function switchSession(sessionFile, session = null, project = null) {
         return;
       }
 
-      // All historical sessions: read-only browse. Live switch only in TUI (/resume).
+      const label = sessionLabel(session);
       const sameCwd = sessionBelongsToLiveCwd(project, sessionFile);
-      const notice = sameCwd
-        ? 'History view (read-only). To make this the live session, run /resume in the Pi terminal — Tau will follow automatically.'
-        : 'Other directory — history only (read-only). Live Pi session stays in the current working directory.';
-      await openSessionReadOnly(session, project, notice);
+
+      // Same working directory → resume like TUI /resume pick (path as arg)
+      if (sameCwd) {
+        statusText.textContent = 'Resuming…';
+        messageRenderer.renderSystemMessage(
+          `Resuming “${label}” (same as /resume in terminal)…`
+        );
+        try {
+          const result = await resumeLikeTui(sessionFile);
+          if (result.ok) {
+            mirrorActiveSessionFile = result.data?.sessionFile || sessionFile;
+            if (result.data?.cwd) {
+              mirrorActiveCwd = result.data.cwd;
+              sidebar.setLiveCwd(mirrorActiveCwd);
+            }
+            viewingActiveSession = true;
+            updateMirrorInputState();
+            sidebar.setActive(mirrorActiveSessionFile);
+            statusText.textContent = 'Session resumed';
+            setTimeout(() => { statusText.textContent = 'Connected'; }, 1500);
+            // Snapshot is broadcast by server; request again as safety net
+            setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 300);
+            setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 900);
+            return;
+          }
+          // Fall back to history if resume refused (hook not ready, etc.)
+          console.warn('[App] Resume-like failed:', result.error);
+          await openSessionReadOnly(
+            session,
+            project,
+            `Could not resume “${label}”: ${result.error || 'unknown'}. Showing history. Tip: in Pi run /tau-switch once, then retry — or use /resume in the terminal.`
+          );
+          return;
+        } catch (e) {
+          console.warn('[App] Resume error:', e);
+          await openSessionReadOnly(
+            session,
+            project,
+            `Resume failed for “${label}”. Showing history read-only.`
+          );
+          return;
+        }
+      }
+
+      // Other directory → history only
+      await openSessionReadOnly(
+        session,
+        project,
+        `“${label}” is in another directory — history only. Use /resume in the Pi terminal to live-switch across directories.`
+      );
       return;
     }
 
-    // Non-mirror path (standalone): history only
     await openSessionReadOnly(session, project, null);
   } catch (error) {
     console.error('[App] Failed to open session:', error);

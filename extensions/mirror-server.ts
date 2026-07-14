@@ -21,6 +21,7 @@ import QRCode from "qrcode";
 import {
   createPiCommandAdapter,
   refreshSessionCapture,
+  resumeSessionLikeTui,
   setSessionSwitcher,
   type CommandDescriptor,
   type PiCommandAdapter,
@@ -286,26 +287,37 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // Capture switchSession from command context (most reliable path)
+  // Same code path as TUI /resume after you pick a session (ctx.switchSession → handleResumeSession).
+  // Args: absolute path to session .jsonl (or quoted path). No args = arm the hook only.
   pi.registerCommand("tau-switch", {
-    description: "Switch live Pi session (Tau Web sidebar). Args: absolute session .jsonl path",
+    description:
+      "Resume a session like TUI /resume (pick). Args: absolute session .jsonl path. Used by Tau Web sidebar.",
     handler: async (args, ctx) => {
       armSessionSwitcher(ctx);
-      const target = (args || "").trim();
+      const target = (args || "").trim().replace(/^["']|["']$/g, "");
       if (!target) {
-        ctx.ui.notify("Tau switchSession hook ready — sidebar can switch sessions now", "info");
+        ctx.ui.notify("Tau resume hook ready — sidebar can resume same-cwd sessions", "info");
         return;
       }
       try {
-        const result = await ctx.switchSession(target);
-        if (result?.cancelled) {
-          ctx.ui.notify("Session switch cancelled", "warning");
+        // Prefer shared safe helper (cwd preflight + process.exit guard)
+        const result = await resumeSessionLikeTui(target, {
+          requireSameCwd: true,
+          liveCwd: (ctx as any).cwd || process.cwd(),
+        });
+        if (result.cancelled) {
+          ctx.ui.notify("Session resume cancelled", "warning");
           return;
         }
-        ctx.ui.notify("Switched session", "info");
+        if (!result.ok) {
+          ctx.ui.notify(result.error || "Resume failed", "error");
+          return;
+        }
+        ctx.ui.notify("Resumed session (like /resume)", "info");
       } catch (e: any) {
-        ctx.ui.notify(`Switch failed: ${e?.message || e}`, "error");
-        throw e;
+        // Never rethrow — uncaught errors can tear down interactive mode
+        ctx.ui.notify(`Resume failed: ${e?.message || e}`, "error");
+        console.warn("[Tau] /tau-switch error:", e);
       }
     },
   });
@@ -946,16 +958,45 @@ export default function (pi: ExtensionAPI) {
         }
 
         case "switch_session": {
-          // Disabled: programmatic switchSession from the web UI destabilizes Pi
-          // (memctx/hephaestus reload + process teardown). Browse history via HTTP instead.
-          sendTo(ws, {
-            type: "response",
-            command: "switch_session",
-            success: false,
-            id,
-            error:
-              "Live session switch from Tau Web is disabled. Use /resume in the Pi terminal; the GUI will follow.",
+          // Resume like TUI /resume pick — absolute session path, same-cwd only
+          const sessionFile = typeof command.sessionFile === "string" ? command.sessionFile : "";
+          if (!sessionFile) {
+            sendTo(ws, error("switch_session", "sessionFile required"));
+            break;
+          }
+          if (ctx && !ctx.isIdle()) {
+            sendTo(ws, error("switch_session", "Agent is busy — finish the current turn first"));
+            break;
+          }
+          refreshSessionCapture(ctx || undefined, pi as any);
+          const result = await resumeSessionLikeTui(sessionFile, {
+            requireSameCwd: true,
+            liveCwd: (ctx as any)?.cwd || process.cwd(),
           });
+          if (result.ok) {
+            invalidateCommands("session_switch");
+            gitCache = null;
+            try {
+              if (latestCtx) {
+                const snapshot = await buildStateSnapshot(latestCtx);
+                broadcast(snapshot);
+              }
+            } catch { /* ignore */ }
+            sendTo(ws, success("switch_session", {
+              sessionFile,
+              switched: true,
+              mode: "resume-like-tui",
+            }));
+          } else {
+            sendTo(ws, {
+              type: "response",
+              command: "switch_session",
+              success: false,
+              id,
+              error: result.error || "Resume failed",
+              data: result,
+            });
+          }
           break;
         }
 
@@ -1498,13 +1539,74 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return;
     }
 
-    // Live switch disabled — clients should load history via GET /api/sessions/:dir/:file
-    if (urlPath === "/api/sessions/switch" && req.method === "POST") {
-      res.writeHead(405, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        error: "Live session switch from Tau Web is disabled",
-        hint: "Use /resume in the Pi terminal. Sidebar clicks open history read-only; the GUI follows TUI live session automatically.",
-      }));
+    // Resume like TUI /resume after picking a session (same-cwd only)
+    if (
+      (urlPath === "/api/sessions/switch" || urlPath === "/api/sessions/resume") &&
+      req.method === "POST"
+    ) {
+      let body = "";
+      req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+      req.on("end", async () => {
+        try {
+          const { sessionFile } = JSON.parse(body || "{}");
+          if (!sessionFile || typeof sessionFile !== "string") {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "sessionFile required" }));
+            return;
+          }
+          if (latestCtx && !latestCtx.isIdle()) {
+            res.writeHead(409, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Agent is busy — finish the current turn first" }));
+            return;
+          }
+          refreshSessionCapture(latestCtx || undefined, pi as any);
+          try { pi.getCommands?.(); } catch { /* ignore */ }
+
+          const result = await resumeSessionLikeTui(sessionFile, {
+            requireSameCwd: true,
+            liveCwd: (latestCtx as any)?.cwd || process.cwd(),
+          });
+
+          if (!result.ok) {
+            res.writeHead(result.cancelled ? 409 : 400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              error: result.error || "Resume failed",
+              cancelled: result.cancelled,
+              readonly: true,
+              hint: result.error?.includes("another directory")
+                ? "Other-directory sessions are history-only in Tau. Use /resume in the Pi terminal for cross-cwd."
+                : "Run /tau-switch once in the terminal to arm the hook, then retry.",
+            }));
+            return;
+          }
+
+          // Let session_start rebind, then push snapshot
+          await new Promise((r) => setTimeout(r, 200));
+          invalidateCommands("session_switch");
+          gitCache = null;
+          try {
+            if (latestCtx) {
+              const liveFile = latestCtx.sessionManager?.getSessionFile?.() || sessionFile;
+              updateInstanceSession(liveFile, (latestCtx as any).cwd || process.cwd());
+              const snapshot = await buildStateSnapshot(latestCtx);
+              broadcast(snapshot);
+            }
+          } catch (e) {
+            console.warn("[Mirror] post-resume snapshot failed:", e);
+          }
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            success: true,
+            mode: "resume-like-tui",
+            sessionFile: latestCtx?.sessionManager?.getSessionFile?.() || sessionFile,
+            cwd: (latestCtx as any)?.cwd || process.cwd(),
+          }));
+        } catch (e: any) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: e?.message || String(e) }));
+        }
+      });
       return;
     }
 

@@ -2133,22 +2133,28 @@ body {
 }
 
 /* ═══════════════════════════════════════════════════════
-   Code Blocks — unified width, right gutter for breathing room
+   Shared rail for tool / thinking / code — same width, right gap
    ═══════════════════════════════════════════════════════ */
+
+:root {
+  --msg-rail-max: 40rem;   /* ~640px: unified bubble width */
+  --msg-rail-gap: 4.5rem;  /* right breathing room — never flush to edge */
+}
 
 .code-block-wrapper {
   position: relative;
   display: block;
-  width: calc(100% - 48px);
-  max-width: 100%;
+  width: min(var(--msg-rail-max), calc(100% - var(--msg-rail-gap)));
+  max-width: calc(100% - var(--msg-rail-gap));
   min-width: 0;
-  margin: 8px 48px 8px 0;
+  margin: 8px var(--msg-rail-gap) 8px 0;
   border-radius: var(--radius);
   overflow: hidden;
   border: 1px solid var(--border);
   background: rgba(0, 0, 0, 0.25);
   backdrop-filter: blur(12px);
   box-sizing: border-box;
+  align-self: flex-start;
 }
 
 :root[data-theme="clean"] .code-block-wrapper,
@@ -2257,14 +2263,14 @@ code {
   background: var(--thinking-bg);
   border: 1px solid var(--border);
   padding: 0;
-  margin: 2px 48px 2px 0;
+  margin: 2px var(--msg-rail-gap) 2px 0;
   border-radius: var(--radius);
   font-size: 13px;
   color: var(--text-secondary);
   overflow: hidden;
-  align-self: stretch;
-  width: calc(100% - 48px);
-  max-width: 100%;
+  align-self: flex-start;
+  width: min(var(--msg-rail-max), calc(100% - var(--msg-rail-gap)));
+  max-width: calc(100% - var(--msg-rail-gap));
   min-width: 0;
   flex-shrink: 0;
   box-sizing: border-box;
@@ -2332,12 +2338,12 @@ body.hide-thinking .thinking-block { display: none !important; }
   background: var(--tool-bg);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  margin: 2px 48px 2px 0;
+  margin: 2px var(--msg-rail-gap) 2px 0;
   font-size: 13px;
   overflow: hidden;
-  align-self: stretch;
-  width: calc(100% - 48px);
-  max-width: 100%;
+  align-self: flex-start;
+  width: min(var(--msg-rail-max), calc(100% - var(--msg-rail-gap)));
+  max-width: calc(100% - var(--msg-rail-gap));
   min-width: 0;
   flex-shrink: 0;
   box-sizing: border-box;
@@ -3624,8 +3630,9 @@ body.hide-thinking .thinking-block { display: none !important; }
 
 
   .tool-card, .thinking-block, .code-block-wrapper {
-    width: calc(100% - 20px);
-    margin-right: 20px;
+    width: min(var(--msg-rail-max), calc(100% - 1.5rem));
+    max-width: calc(100% - 1.5rem);
+    margin-right: 1.5rem;
   }
   .tool-args-preview { max-width: none; }
   .file-sidebar, #file-sidebar-toggle { display: none !important; }
