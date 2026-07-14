@@ -13,7 +13,7 @@
  *
  * NEVER call process.exit from this file — browser close must not kill Pi.
  */
-const TAU_BUILD_ID = "tau-2026-07-14-no-exit-v3";
+const TAU_BUILD_ID = "tau-2026-07-14-fix-barePath-v4";
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { WebSocketServer, WebSocket } from "ws";
@@ -1360,6 +1360,9 @@ export default function (pi: ExtensionAPI) {
   // API routes (sessions list, etc.)
   // ═══════════════════════════════════════
   function handleApiRoute(req: http.IncomingMessage, res: http.ServerResponse, urlPath: string) {
+    // Path without query string — used by all /api/* matchers below
+    const barePath = (urlPath.split("?")[0] || "/");
+
     // CORS headers
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -1564,8 +1567,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
 
     // Session history by absolute file path (preferred — avoids dirName encoding issues)
     // GET /api/sessions/by-path?path=C:\Users\...\.pi\agent\sessions\...\file.jsonl
-    const bareForSessions = (urlPath.split("?")[0] || "");
-    if (bareForSessions === "/api/sessions/by-path" && req.method === "GET") {
+    if (barePath === "/api/sessions/by-path" && req.method === "GET") {
       try {
         const u = new URL(req.url || "/", "http://127.0.0.1");
         let filePath = u.searchParams.get("path") || "";
@@ -1593,7 +1595,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     }
 
     // Session file endpoint: /api/sessions/:dirName/:file
-    const sessionMatch = bareForSessions.match(/^\/api\/sessions\/([^/]+)\/([^/]+)$/);
+    const sessionMatch = barePath.match(/^\/api\/sessions\/([^/]+)\/([^/]+)$/);
     if (sessionMatch && req.method === "GET") {
       let dirName = sessionMatch[1];
       let file = sessionMatch[2];
@@ -1605,7 +1607,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
 
     // Browser tab close beacon — ALWAYS no-op for process lifetime.
     // (Leftover tabs + auto-open were killing Pi on startup via process.exit.)
-    if (urlPath === "/api/shutdown" || barePath === "/api/shutdown") {
+    if (barePath === "/api/shutdown") {
       if (req.method === "POST" || req.method === "GET") {
         let body = "";
         req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
@@ -1632,7 +1634,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     }
 
     // POST /api/sessions/new — same as TUI /new
-    if (bareForSessions === "/api/sessions/new" && req.method === "POST") {
+    if (barePath === "/api/sessions/new" && req.method === "POST") {
       (async () => {
         try {
           if (latestCtx && !latestCtx.isIdle()) {
