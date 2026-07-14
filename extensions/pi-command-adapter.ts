@@ -858,46 +858,8 @@ export function sendPromptToLiveSession(
     }
   }
 
-  // Text: prefer rebinding session.prompt, then sendUserMessage
-  try {
-    if (capturedSession && typeof capturedSession.prompt === "function") {
-      let isStreaming = false;
-      try {
-        isStreaming =
-          typeof capturedSession.isStreaming === "boolean"
-            ? capturedSession.isStreaming
-            : typeof capturedSession.isIdle === "function"
-              ? !capturedSession.isIdle()
-              : false;
-      } catch {
-        isStreaming = false;
-      }
-      const streamingBehavior =
-        options?.streamingBehavior === "immediate" || options?.streamingBehavior === "steer"
-          ? "steer"
-          : options?.streamingBehavior === "followUp"
-            ? "followUp"
-            : isStreaming
-              ? "followUp"
-              : undefined;
-      void Promise.resolve(
-        capturedSession.prompt(message, {
-          expandPromptTemplates: true,
-          ...(streamingBehavior ? { streamingBehavior } : {}),
-          source: "extension",
-        })
-      ).catch((e: any) => {
-        console.warn("[Tau] session.prompt failed, falling back to sendUserMessage:", e);
-        try {
-          pi.sendUserMessage?.(message);
-        } catch { /* ignore */ }
-      });
-      return { ok: true };
-    }
-  } catch (e) {
-    console.warn("[Tau] session.prompt path failed:", e);
-  }
-
+  // Prefer pi.sendUserMessage — rebinds with current session and reliably emits
+  // message_* events to mirror subscribers (capturedSession.prompt can be stale).
   try {
     if (typeof pi.sendUserMessage === "function") {
       if (options?.streamingBehavior === "steer" || options?.streamingBehavior === "immediate") {
@@ -910,10 +872,24 @@ export function sendPromptToLiveSession(
       return { ok: true };
     }
   } catch (e) {
+    console.warn("[Tau] pi.sendUserMessage failed, trying session.prompt:", e);
+  }
+
+  try {
+    if (capturedSession && typeof capturedSession.prompt === "function") {
+      void Promise.resolve(
+        capturedSession.prompt(message, {
+          expandPromptTemplates: true,
+          source: "extension",
+        })
+      ).catch((err: any) => console.warn("[Tau] session.prompt failed:", err));
+      return { ok: true };
+    }
+  } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
 
-  return { ok: false, error: "No live prompt channel (session.prompt / pi.sendUserMessage)" };
+  return { ok: false, error: "No live prompt channel (pi.sendUserMessage / session.prompt)" };
 }
 
 export { TUI_BUILTINS };

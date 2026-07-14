@@ -13,7 +13,7 @@
  *
  * NEVER call process.exit from this file — browser close must not kill Pi.
  */
-const TAU_BUILD_ID = "tau-2026-07-14-fix-barePath-v4";
+const TAU_BUILD_ID = "tau-2026-07-14-fix-kill0-v5";
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { WebSocketServer, WebSocket } from "ws";
@@ -184,7 +184,12 @@ function getRunningInstances(): Array<{ port: number; pid: number; sessionFile: 
     if (!file.endsWith(".json")) continue;
     try {
       const info = JSON.parse(fs.readFileSync(path.join(INSTANCES_DIR, file), "utf8"));
-      // Check if process is still alive
+      // Own process is always alive — never probe with kill(self, 0)
+      if (info.pid === process.pid) {
+        instances.push(info);
+        continue;
+      }
+      // Signal 0 = existence check only (does not terminate)
       try {
         process.kill(info.pid, 0);
         instances.push(info);
@@ -629,11 +634,22 @@ export default function (pi: ExtensionAPI) {
 
   for (const eventType of eventTypes) {
     pi.on(eventType as any, async (event: any, ctx: ExtensionContext) => {
-      latestCtx = ctx;
+      try {
+        if (ctx) latestCtx = ctx;
+      } catch {
+        /* stale ctx after switch — ignore */
+      }
 
-      // Forward event to all connected browser clients
-      // Wrap in { type: "event", event: ... } to match the existing frontend protocol
-      broadcast({ type: "event", event: { type: eventType, ...event } });
+      // Forward to browsers. Put eventType last so nested event.type cannot overwrite.
+      try {
+        const payload =
+          event && typeof event === "object"
+            ? { ...event, type: eventType }
+            : { type: eventType };
+        broadcast({ type: "event", event: payload });
+      } catch (e) {
+        console.warn(`[Mirror] broadcast ${eventType} failed:`, e);
+      }
     });
   }
 
@@ -2553,30 +2569,19 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     console.log("[Mirror] Session ended (mirror server kept alive)");
   });
 
-  // Diagnostic: if something still tries to kill Pi, log stack instead of dying
+  // Block accidental process.exit only. Do NOT block process.kill(pid, 0) —
+  // that is the standard liveness probe used by getRunningInstances().
   const realExit = process.exit.bind(process);
-  const realKill = process.kill.bind(process);
   (process as any).exit = (code?: number) => {
     console.error(
       `[Mirror] BLOCKED process.exit(${code ?? 0}) build=${TAU_BUILD_ID}\n` +
         (new Error().stack || "")
     );
   };
-  (process as any).kill = (pid: number, sig?: any) => {
-    if (pid === process.pid) {
-      console.error(
-        `[Mirror] BLOCKED process.kill(self, ${sig}) build=${TAU_BUILD_ID}\n` +
-          (new Error().stack || "")
-      );
-      return true;
-    }
-    return realKill(pid, sig);
-  };
 
   const restoreAndExit = (sig: string) => {
-    console.log(`[Mirror] Received ${sig} — restoring process.exit/kill and shutting down`);
+    console.log(`[Mirror] Received ${sig} — restoring process.exit and shutting down`);
     process.exit = realExit as typeof process.exit;
-    process.kill = realKill as typeof process.kill;
     try { stopServer(); } catch { /* ignore */ }
     realExit(0);
   };
@@ -2585,10 +2590,9 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
 
   let extPath = "unknown";
   try {
-    // jiti / CJS often provide __filename
     extPath = typeof __filename !== "undefined" ? __filename : "esm";
   } catch { /* ignore */ }
   console.log(`[Mirror] === TAU BUILD ${TAU_BUILD_ID} loaded ===`);
   console.log(`[Mirror] extension file: ${extPath}`);
-  console.log(`[Mirror] process.exit/kill(self) intercepted — browser cannot kill Pi`);
+  console.log(`[Mirror] process.exit intercepted; kill(pid,0) liveness checks OK`);
 }
