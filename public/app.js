@@ -799,6 +799,11 @@ function renderAttachmentPreviews() {
 let messageQueue = [];
 
 function sendMessage() {
+  if (isMirrorMode && !viewingActiveSession) {
+    messageRenderer.renderSystemMessage('Read-only history — resume a live session or use /new before sending.');
+    return;
+  }
+
   const message = messageInput.value.trim();
   if (!message && pendingImages.length === 0) return;
 
@@ -1271,17 +1276,7 @@ sidebarOverlay.addEventListener('click', () => {
 
 const newSessionBtn = document.getElementById('new-session-btn');
 newSessionBtn.addEventListener('click', () => {
-  sessionTotalCost = 0;
-  lastInputTokens = 0;
-  updateCostDisplay();
-  updateTokenUsage();
-  state.reset();
-  messageRenderer.clear();
-  toolCardRenderer.clear();
-  messageRenderer.renderWelcome();
-  sidebar.clearActive();
-  viewingActiveSession = true;
-  updateMirrorInputState();
+  void createNewLiveSession();
 });
 
 refreshSessionsBtn.addEventListener('click', () => {
@@ -1340,13 +1335,81 @@ sessionSearchInput.addEventListener('input', () => {
   sidebar.setSearchQuery(sessionSearchInput.value);
 });
 
+/** Create a new live Pi session (TUI /new) and sync GUI */
+async function createNewLiveSession() {
+  suppressBrowserExit = true;
+  try {
+    sessionTotalCost = 0;
+    lastInputTokens = 0;
+    updateCostDisplay();
+    updateTokenUsage();
+    statusText.textContent = 'New session…';
+
+    if (!isMirrorMode) {
+      state.reset();
+      messageRenderer.clear();
+      toolCardRenderer.clear();
+      messageRenderer.renderWelcome();
+      sidebar.clearActive();
+      viewingActiveSession = true;
+      updateMirrorInputState();
+      return;
+    }
+
+    // Prefer HTTP so we get a clear success + broadcast snapshot
+    let ok = false;
+    try {
+      const res = await fetch('/api/sessions/new', { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      ok = res.ok && data.success;
+      if (ok) {
+        mirrorActiveSessionFile = data.sessionFile || null;
+        if (data.cwd) {
+          mirrorActiveCwd = data.cwd;
+          sidebar.setLiveCwd(mirrorActiveCwd);
+        }
+      } else {
+        console.warn('[App] /api/sessions/new failed:', data.error);
+      }
+    } catch (e) {
+      console.warn('[App] /api/sessions/new error:', e);
+    }
+
+    // WS fallback
+    if (!ok) {
+      try {
+        wsClient.send({ type: 'new_session' });
+        ok = true;
+      } catch (e) {
+        console.warn('[App] WS new_session failed:', e);
+      }
+    }
+
+    state.reset();
+    messageRenderer.clear();
+    toolCardRenderer.clear();
+    messageRenderer.renderWelcome();
+    sidebar.clearActive();
+    viewingActiveSession = true;
+    updateMirrorInputState();
+    if (ok) {
+      setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 300);
+      setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 900);
+      statusText.textContent = 'New session';
+      messageRenderer.renderSystemMessage('New session started (synced with Pi TUI).');
+    } else {
+      messageRenderer.renderSystemMessage(
+        'Could not start a new Pi session from GUI. Use /new in the terminal.'
+      );
+    }
+    setTimeout(() => { statusText.textContent = 'Connected'; }, 1500);
+  } finally {
+    setTimeout(() => { suppressBrowserExit = false; }, 2000);
+  }
+}
+
 async function newSession() {
-  sessionTotalCost = 0;
-  lastInputTokens = 0;
-  updateCostDisplay();
-  updateTokenUsage();
-  await switchSession(null);
-  sidebar.clearActive();
+  await createNewLiveSession();
   if (isMobile()) {
     sidebarEl.classList.add('collapsed');
     sidebarOverlay.classList.remove('visible');
@@ -1460,6 +1523,7 @@ async function resumeLikeTui(sessionFile) {
 }
 
 async function switchSession(sessionFile, session = null, project = null) {
+  suppressBrowserExit = true;
   try {
     currentStreamingElement = null;
     currentStreamingThinking = '';
@@ -1587,6 +1651,8 @@ async function switchSession(sessionFile, session = null, project = null) {
   } catch (error) {
     console.error('[App] Failed to open session:', error);
     messageRenderer.renderError('Failed to open session');
+  } finally {
+    setTimeout(() => { suppressBrowserExit = false; }, 3000);
   }
 }
 
@@ -2461,8 +2527,45 @@ if (splash) {
   });
 }
 
-// NOTE: Do NOT auto-stop Tau or exit Pi on pagehide/beforeunload.
-// Those events fire spuriously during session ops and previously killed the TUI.
-// Use /taustop in the terminal (or close the Pi process) to tear down the mirror.
+// ═══════════════════════════════════════
+// Close browser tab → stop Tau port + exit Pi
+// Suppress during resume/new so mid-op pagehide cannot kill TUI.
+// ═══════════════════════════════════════
+let browserExitSent = false;
+let suppressBrowserExit = false;
 
-console.log('[Tau] initialized (browse-only sessions; no auto-shutdown)');
+function requestBrowserCloseShutdown(reason = 'pagehide') {
+  if (browserExitSent || suppressBrowserExit) {
+    console.log('[Tau] Exit suppressed:', reason, { browserExitSent, suppressBrowserExit });
+    return;
+  }
+  browserExitSent = true;
+  const payload = JSON.stringify({ reason, exitProcess: true });
+  try {
+    if (navigator.sendBeacon) {
+      const blob = new Blob([payload], { type: 'application/json' });
+      if (navigator.sendBeacon('/api/shutdown?exit=1', blob)) {
+        console.log('[Tau] Exit beacon sent:', reason);
+        return;
+      }
+    }
+  } catch { /* fall through */ }
+  try {
+    fetch('/api/shutdown?exit=1', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: payload,
+      keepalive: true,
+    }).catch(() => {});
+  } catch { /* ignore */ }
+  try {
+    wsClient?.send?.({ type: 'shutdown', reason, exitProcess: true });
+  } catch { /* ignore */ }
+}
+
+window.addEventListener('pagehide', (e) => {
+  if (e.persisted) return; // bfcache — not a real close
+  requestBrowserCloseShutdown('pagehide');
+});
+
+console.log('[Tau] initialized (safe prompt/new-session; exit on tab close)');

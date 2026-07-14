@@ -22,6 +22,8 @@ import {
   createPiCommandAdapter,
   refreshSessionCapture,
   resumeSessionLikeTui,
+  newSessionLikeTui,
+  sendPromptToLiveSession,
   type CommandDescriptor,
   type PiCommandAdapter,
 } from "./pi-command-adapter";
@@ -779,70 +781,98 @@ export default function (pi: ExtensionAPI) {
     try {
       switch (command.type) {
         // ─── Prompting ───
+        // Never call latestCtx.isIdle() without guard — after switchSession the ctx
+        // is stale and throws, which previously swallowed prompts (GUI showed, TUI silent).
         case "prompt": {
-          if (ctx && !ctx.isIdle()) {
-            const behavior = command.streamingBehavior || "steer";
-            if (behavior === "steer") {
-              pi.sendUserMessage(command.message, { deliverAs: "steer" });
-            } else {
-              pi.sendUserMessage(command.message, { deliverAs: "followUp" });
-            }
-          } else {
-            // Build content with optional images
-            if (command.images?.length) {
-              const validMimes = ["image/png", "image/jpeg", "image/gif", "image/webp"];
-              const content: any[] = [{ type: "text", text: command.message || "(see attached image)" }];
-              for (const img of command.images) {
-                if (!img.data || typeof img.data !== "string") {
-                  console.error("[mirror-server] Skipping image: missing or invalid data");
-                  continue;
-                }
-                // Strip data URL prefix if accidentally included
-                const data = img.data.includes(",") ? img.data.split(",")[1] : img.data;
-                const mimeType = (validMimes.includes(img.mimeType) ? img.mimeType : "image/png") as "image/png" | "image/jpeg" | "image/gif" | "image/webp";
-                console.log(`[mirror-server] Image: mimeType=${mimeType}, dataLen=${data.length}, rawMimeType=${img.mimeType}`);
-                const imageBlock = {
-                  type: "image" as const,
-                  data: data,
-                  mimeType: mimeType,
-                };
-                // Defensive: verify mimeType is actually set (debug crash where it was missing)
-                if (!imageBlock.mimeType) {
-                  console.error(`[mirror-server] BUG: mimeType is falsy after assignment! img.mimeType=${img.mimeType}, falling back to image/png`);
-                  imageBlock.mimeType = "image/png";
-                }
-                content.push(imageBlock);
+          refreshSessionCapture(undefined, pi as any);
+          let payload: string | any[] = command.message || "";
+          if (command.images?.length) {
+            const validMimes = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+            const content: any[] = [{ type: "text", text: command.message || "(see attached image)" }];
+            for (const img of command.images) {
+              if (!img.data || typeof img.data !== "string") {
+                console.error("[mirror-server] Skipping image: missing or invalid data");
+                continue;
               }
-              // Only send content array if we actually have images, otherwise just text
-              const hasImages = content.some((c: any) => c.type === "image");
-              if (hasImages) {
-                pi.sendUserMessage(content);
-              } else {
-                pi.sendUserMessage(command.message);
-              }
-            } else {
-              pi.sendUserMessage(command.message);
+              const data = img.data.includes(",") ? img.data.split(",")[1] : img.data;
+              const mimeType = (validMimes.includes(img.mimeType) ? img.mimeType : "image/png") as
+                | "image/png"
+                | "image/jpeg"
+                | "image/gif"
+                | "image/webp";
+              content.push({ type: "image" as const, data, mimeType });
             }
+            if (content.some((c: any) => c.type === "image")) payload = content;
           }
-          sendTo(ws, success("prompt"));
+          const sent = sendPromptToLiveSession(pi as any, payload, {
+            streamingBehavior: command.streamingBehavior || undefined,
+          });
+          if (sent.ok) sendTo(ws, success("prompt"));
+          else sendTo(ws, error("prompt", sent.error || "Failed to deliver prompt to live session"));
           break;
         }
 
         case "steer": {
-          pi.sendUserMessage(command.message, { deliverAs: "steer" });
-          sendTo(ws, success("steer"));
+          refreshSessionCapture(undefined, pi as any);
+          const sent = sendPromptToLiveSession(pi as any, command.message, {
+            streamingBehavior: "steer",
+          });
+          if (sent.ok) sendTo(ws, success("steer"));
+          else sendTo(ws, error("steer", sent.error || "steer failed"));
           break;
         }
 
         case "follow_up": {
-          pi.sendUserMessage(command.message, { deliverAs: "followUp" });
-          sendTo(ws, success("follow_up"));
+          refreshSessionCapture(undefined, pi as any);
+          const sent = sendPromptToLiveSession(pi as any, command.message, {
+            streamingBehavior: "followUp",
+          });
+          if (sent.ok) sendTo(ws, success("follow_up"));
+          else sendTo(ws, error("follow_up", sent.error || "follow_up failed"));
           break;
         }
 
         case "abort": {
-          if (ctx) ctx.abort();
+          try {
+            if (latestCtx) latestCtx.abort();
+          } catch {
+            try {
+              (pi as any).abort?.();
+            } catch { /* ignore */ }
+          }
           sendTo(ws, success("abort"));
+          break;
+        }
+
+        case "new_session": {
+          refreshSessionCapture(undefined, pi as any);
+          try {
+            const result = await newSessionLikeTui({
+              onNewSession: (newCtx) => {
+                latestCtx = newCtx;
+              },
+            });
+            if (result.ok || (result as any).recovered) {
+              invalidateCommands("new_session");
+              gitCache = null;
+              await new Promise((r) => setTimeout(r, 200));
+              try {
+                if (latestCtx) {
+                  const snapshot = await buildStateSnapshot(latestCtx);
+                  broadcast(snapshot);
+                }
+              } catch (e) {
+                console.warn("[Mirror] post-new snapshot:", e);
+              }
+              sendTo(ws, success("new_session", {
+                sessionFile: result.newSessionFile || latestCtx?.sessionManager?.getSessionFile?.(),
+              }));
+            } else {
+              sendTo(ws, error("new_session", result.error || "New session failed"));
+            }
+          } catch (e: any) {
+            sendTo(ws, error("new_session", e?.message || String(e)));
+          }
           break;
         }
 
@@ -957,11 +987,17 @@ export default function (pi: ExtensionAPI) {
         }
 
         case "shutdown": {
-          // Intentionally ignored — browser must not stop/kill Pi
-          sendTo(ws, success("shutdown", {
-            ignored: true,
-            message: "Use /taustop in Pi to stop the mirror",
-          }));
+          const exitProcess = command.exitProcess === true || command.exit === true;
+          sendTo(ws, success("shutdown", { stoppingServer: true, exitProcess }));
+          setTimeout(() => {
+            if (exitProcess) quitPiProcess(command.reason || "ws_shutdown");
+            else {
+              try {
+                stopServer();
+                console.log("[Mirror] Server stopped via WS (Pi kept alive)");
+              } catch { /* ignore */ }
+            }
+          }, 100);
           break;
         }
 
@@ -1551,15 +1587,91 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return;
     }
 
-    // Legacy no-op: browser must never stop/kill Pi via this endpoint.
-    // Real stop: /taustop in TUI. (Kept so old clients get 200 instead of errors.)
-    if (urlPath === "/api/shutdown" && (req.method === "POST" || req.method === "GET")) {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        ok: true,
-        ignored: true,
-        message: "Browser shutdown disabled — use /taustop in Pi to stop the mirror",
-      }));
+    // Close browser tab → stop mirror (+ optional exit Pi). Default exitProcess=true
+    // when body requests it; beacon without body still stops server only unless exit=1 query.
+    if (urlPath === "/api/shutdown" || barePath === "/api/shutdown") {
+      if (req.method === "POST" || req.method === "GET") {
+        let body = "";
+        req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+        req.on("end", () => {
+          let reason = "web_ui_closed";
+          let exitProcess = false;
+          try {
+            const u = new URL(req.url || "/", "http://127.0.0.1");
+            if (u.searchParams.get("exit") === "1" || u.searchParams.get("exitProcess") === "1") {
+              exitProcess = true;
+            }
+          } catch { /* ignore */ }
+          try {
+            if (body) {
+              const parsed = JSON.parse(body);
+              if (parsed?.reason) reason = String(parsed.reason);
+              if (parsed?.exitProcess === true || parsed?.exit === true) exitProcess = true;
+            }
+          } catch { /* ignore */ }
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, stoppingServer: true, exitProcess, reason }));
+
+          setTimeout(() => {
+            if (exitProcess) {
+              quitPiProcess(reason);
+            } else {
+              try {
+                stopServer();
+                console.log(`[Mirror] Server stopped (reason: ${reason})`);
+              } catch (e) {
+                console.warn("[Mirror] stopServer failed:", e);
+              }
+            }
+          }, 120);
+        });
+        return;
+      }
+    }
+
+    // POST /api/sessions/new — same as TUI /new
+    if (bareForSessions === "/api/sessions/new" && req.method === "POST") {
+      (async () => {
+        try {
+          if (latestCtx && !latestCtx.isIdle()) {
+            res.writeHead(409, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Agent is busy — finish the current turn first" }));
+            return;
+          }
+          refreshSessionCapture(undefined, pi as any);
+          const result = await newSessionLikeTui({
+            onNewSession: (newCtx) => { latestCtx = newCtx; },
+          });
+          await new Promise((r) => setTimeout(r, 250));
+          if (!result.ok && !(result as any).recovered) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: result.error || "New session failed" }));
+            return;
+          }
+          invalidateCommands("new_session");
+          gitCache = null;
+          try {
+            if (latestCtx) {
+              const liveFile = latestCtx.sessionManager?.getSessionFile?.() || result.newSessionFile || "";
+              updateInstanceSession(liveFile, (latestCtx as any).cwd || process.cwd());
+              const snapshot = await buildStateSnapshot(latestCtx);
+              broadcast(snapshot);
+            }
+          } catch (e) {
+            console.warn("[Mirror] post-new snapshot:", e);
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            success: true,
+            sessionFile: latestCtx?.sessionManager?.getSessionFile?.() || result.newSessionFile,
+            cwd: (latestCtx as any)?.cwd || process.cwd(),
+          }));
+        } catch (e: any) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: e?.message || String(e) }));
+        }
+      })();
       return;
     }
 
@@ -2435,5 +2547,27 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     console.log("[Mirror] Session ended (mirror server kept alive)");
   });
 
-  console.log("[Mirror] Tau extension loaded (browse-only sessions, no process.exit)");
+  let quitting = false;
+  function quitPiProcess(reason: string) {
+    if (quitting) return;
+    quitting = true;
+    console.log(`[Mirror] Quitting Pi process (reason: ${reason})`);
+    try {
+      stopServer();
+    } catch { /* ignore */ }
+    try {
+      latestCtx?.ui?.notify?.("Tau Web closed — shutting down Pi…", "info");
+    } catch { /* ignore */ }
+    setTimeout(() => {
+      try {
+        process.exit(0);
+      } catch {
+        try {
+          process.kill(process.pid, "SIGTERM");
+        } catch { /* ignore */ }
+      }
+    }, 200);
+  }
+
+  console.log("[Mirror] Tau extension loaded (prompt/new-session safe, exit on browser close)");
 }

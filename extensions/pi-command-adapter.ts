@@ -68,6 +68,10 @@ let capturedRunner: any = null;
 let capturedSwitchSession:
   | ((sessionPath: string, options?: any) => Promise<{ cancelled?: boolean }>)
   | null = null;
+/** Live newSession from interactive mode (bound via bindCommandContext) */
+let capturedNewSession:
+  | ((options?: any) => Promise<{ cancelled?: boolean }>)
+  | null = null;
 let patched = false;
 
 function resolvePiPkgRoot(): string | null {
@@ -175,6 +179,11 @@ function tryPatchInternals(): void {
                   capturedSwitchSession = (sessionPath: string, options?: any) =>
                     liveSwitch(sessionPath, options);
                   console.log("[Tau] Captured interactive switchSession (handleResumeSession)");
+                }
+                if (actions?.newSession) {
+                  const liveNew = actions.newSession.bind(actions);
+                  capturedNewSession = (options?: any) => liveNew(options);
+                  console.log("[Tau] Captured interactive newSession");
                 }
                 return result;
               };
@@ -755,6 +764,156 @@ export async function resumeSessionLikeTui(
 /** @deprecated use resumeSessionLikeTui */
 export async function switchPiSession(sessionFile: string) {
   return resumeSessionLikeTui(sessionFile, { requireSameCwd: false });
+}
+
+/**
+ * Start a new session the same way TUI /new does (interactive newSession).
+ * Uses withSession so callers can rebind latestCtx without touching a stale ctx.
+ */
+export async function newSessionLikeTui(options?: {
+  onNewSession?: (newCtx: any) => void | Promise<void>;
+}): Promise<{ ok: boolean; cancelled?: boolean; error?: string; newSessionFile?: string | null }> {
+  tryPatchInternals();
+  refreshSessionCapture();
+
+  const runNew = async (opts?: any) => {
+    if (capturedNewSession) return capturedNewSession(opts);
+    if (capturedRunner && typeof capturedRunner.createCommandContext === "function") {
+      const cmdCtx = capturedRunner.createCommandContext();
+      if (typeof cmdCtx?.newSession === "function") {
+        return cmdCtx.newSession(opts);
+      }
+    }
+    const runner = capturedSession?.extensionRunner;
+    if (runner?.createCommandContext) {
+      const cmdCtx = runner.createCommandContext();
+      if (typeof cmdCtx?.newSession === "function") {
+        return cmdCtx.newSession(opts);
+      }
+    }
+    throw new Error(
+      "New-session hook not ready. Wait for Pi interactive mode, or run /new in the terminal."
+    );
+  };
+
+  let newSessionFile: string | null = null;
+  try {
+    const result = await withBlockedProcessExit(async () => {
+      return runNew({
+        withSession: async (newCtx: any) => {
+          try {
+            newSessionFile =
+              newCtx?.sessionManager?.getSessionFile?.() ||
+              newCtx?.sessionFile ||
+              null;
+            if (options?.onNewSession) await options.onNewSession(newCtx);
+          } catch (e) {
+            console.warn("[Tau] newSession withSession error (ignored):", e);
+          }
+        },
+      });
+    });
+    if (result && (result as any).cancelled) {
+      return { ok: false, cancelled: true, error: "New session cancelled" };
+    }
+    console.log("[Tau] newSession ok →", newSessionFile || "(in-memory?)");
+    return { ok: true, newSessionFile };
+  } catch (e) {
+    const lastError = e instanceof Error ? e.message : String(e);
+    console.warn("[Tau] newSession threw:", lastError);
+    if (/stale after session replacement|ctx is stale/i.test(lastError)) {
+      return { ok: true, recovered: true as any, newSessionFile, error: lastError };
+    }
+    return { ok: false, error: lastError, newSessionFile };
+  }
+}
+
+/**
+ * Deliver a user prompt to the live Pi session without touching ExtensionContext
+ * (latestCtx can be stale after switchSession and throws on isIdle()).
+ */
+export function sendPromptToLiveSession(
+  pi: PiLike,
+  message: string | any[],
+  options?: { streamingBehavior?: "steer" | "followUp" | "immediate" }
+): { ok: boolean; error?: string } {
+  refreshSessionCapture();
+
+  // Image / multi-part content: use sendUserMessage only
+  if (Array.isArray(message)) {
+    try {
+      if (typeof pi.sendUserMessage !== "function") {
+        return { ok: false, error: "pi.sendUserMessage unavailable" };
+      }
+      if (options?.streamingBehavior === "steer" || options?.streamingBehavior === "immediate") {
+        pi.sendUserMessage(message as any, { deliverAs: "steer" });
+      } else if (options?.streamingBehavior === "followUp") {
+        pi.sendUserMessage(message as any, { deliverAs: "followUp" });
+      } else {
+        pi.sendUserMessage(message as any);
+      }
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  // Text: prefer rebinding session.prompt, then sendUserMessage
+  try {
+    if (capturedSession && typeof capturedSession.prompt === "function") {
+      let isStreaming = false;
+      try {
+        isStreaming =
+          typeof capturedSession.isStreaming === "boolean"
+            ? capturedSession.isStreaming
+            : typeof capturedSession.isIdle === "function"
+              ? !capturedSession.isIdle()
+              : false;
+      } catch {
+        isStreaming = false;
+      }
+      const streamingBehavior =
+        options?.streamingBehavior === "immediate" || options?.streamingBehavior === "steer"
+          ? "steer"
+          : options?.streamingBehavior === "followUp"
+            ? "followUp"
+            : isStreaming
+              ? "followUp"
+              : undefined;
+      void Promise.resolve(
+        capturedSession.prompt(message, {
+          expandPromptTemplates: true,
+          ...(streamingBehavior ? { streamingBehavior } : {}),
+          source: "extension",
+        })
+      ).catch((e: any) => {
+        console.warn("[Tau] session.prompt failed, falling back to sendUserMessage:", e);
+        try {
+          pi.sendUserMessage?.(message);
+        } catch { /* ignore */ }
+      });
+      return { ok: true };
+    }
+  } catch (e) {
+    console.warn("[Tau] session.prompt path failed:", e);
+  }
+
+  try {
+    if (typeof pi.sendUserMessage === "function") {
+      if (options?.streamingBehavior === "steer" || options?.streamingBehavior === "immediate") {
+        pi.sendUserMessage(message, { deliverAs: "steer" });
+      } else if (options?.streamingBehavior === "followUp") {
+        pi.sendUserMessage(message, { deliverAs: "followUp" });
+      } else {
+        pi.sendUserMessage(message);
+      }
+      return { ok: true };
+    }
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+
+  return { ok: false, error: "No live prompt channel (session.prompt / pi.sendUserMessage)" };
 }
 
 export { TUI_BUILTINS };
