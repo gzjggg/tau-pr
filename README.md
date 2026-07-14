@@ -98,7 +98,7 @@ Click a session in the sidebar to switch the live Pi TUI session via `switchSess
 ### UI
 
 - Larger base fonts and stronger accent colors
-- Pixel brand mark (black body **34×36** on white canvas)
+- Pixel brand mark 
 - Light-theme link / skill styling improvements
 - Dual-color slash input (transparent textarea + mirror under a solid bubble)
 
@@ -214,7 +214,6 @@ Remove-Item "$env:LOCALAPPDATA\Temp\jiti" -Recurse -Force -ErrorAction SilentlyC
 
 - Upstream: [deflating/tau](https://github.com/deflating/tau)
 - Pi: [badlogic/pi-mono](https://github.com/badlogic/pi-mono)
-- Session cover inspired by pi-ui-hephaestus / pi-archimedes
 
 ## License
 
