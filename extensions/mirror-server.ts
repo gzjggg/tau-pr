@@ -268,7 +268,7 @@ function cleanupZombieInstances() {
       }
       // Use shared zombie detection
       if (isZombieProcess(info.pid)) {
-        console.log(`[Mirror] Killing zombie Tau instance (PID ${info.pid}, port ${info.port})`);
+        mlog(`[Mirror] Killing zombie Tau instance (PID ${info.pid}, port ${info.port})`);
         process.kill(info.pid, "SIGTERM");
         try { fs.unlinkSync(path.join(INSTANCES_DIR, file)); } catch {}
       }

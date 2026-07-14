@@ -124,7 +124,7 @@ function tryPatchInternals(): void {
       console.warn("[Tau] Could not resolve pi-coding-agent package for session switch hooks");
       return;
     }
-    console.log("[Tau] Hooking pi-coding-agent at", pkgRoot);
+    if (process.env.TAU_DEBUG === "1" || process.env.TAU_DEBUG === "true") console.log("[Tau] Hooking pi-coding-agent at", pkgRoot);
 
     const sessionPath = path.join(pkgRoot, "dist", "core", "agent-session.js");
     const runnerPath = path.join(pkgRoot, "dist", "core", "extensions", "runner.js");
