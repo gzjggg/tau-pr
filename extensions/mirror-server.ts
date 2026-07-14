@@ -13,7 +13,7 @@
  *
  * NEVER call process.exit from this file — browser close must not kill Pi.
  */
-const TAU_BUILD_ID = "tau-2026-07-14-fix-broadcast-v6";
+const TAU_BUILD_ID = "tau-2026-07-14-fix-singleton-v7";
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { WebSocketServer, WebSocket } from "ws";
@@ -117,6 +117,27 @@ const EXIT_GRACE_MS = 60_000;
 const TAU_EXIT_ON_BROWSER_CLOSE = TAU_SETTINGS.exitOnBrowserClose === true;
 // @ts-ignore — __dirname is provided by jiti at runtime
 const STATIC_DIR = process.env.TAU_STATIC_DIR || findPublicDir();
+
+/**
+ * MODULE-LEVEL singleton state.
+ *
+ * Pi re-invokes the extension factory on every session create/switch, which
+ * would otherwise create a fresh `clients` Set while the browser stays connected
+ * to the first HTTP/WS server — live events then go nowhere (GUI only updates
+ * after a session switch triggers mirror_sync history load).
+ *
+ * Keep server/clients/latestCtx at module scope so every factory invocation
+ * shares the same connected browsers.
+ */
+let server: http.Server | null = null;
+let wss: WebSocketServer | null = null;
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+const clients = new Set<WebSocket>();
+let latestCtx: ExtensionContext | null = null;
+let mirrorUrl = "";
+let tailscaleUrl = "";
+let processExitHookInstalled = false;
+let factoryInvokeCount = 0;
 
 function findPublicDir(): string {
     const candidates: string[] = [];
@@ -290,6 +311,11 @@ function sendAuthRequired(res: http.ServerResponse) {
 }
 
 export default function (pi: ExtensionAPI) {
+  factoryInvokeCount++;
+  console.log(
+    `[Mirror] factory invoke #${factoryInvokeCount} (shared clients=${clients.size}, server=${server ? "up" : "down"})`
+  );
+
   // Install session-switch hooks ASAP (before interactive mode binds command context)
   try {
     createPiCommandAdapter(pi as any);
@@ -297,13 +323,8 @@ export default function (pi: ExtensionAPI) {
     console.warn("[Mirror] Early adapter init:", (e as Error).message);
   }
 
-  let server: http.Server | null = null;
-  let wss: WebSocketServer | null = null;
-  let heartbeatTimer: NodeJS.Timeout | null = null;
-  const clients = new Set<WebSocket>();
-
-  // Store latest context reference for use in command handlers
-  let latestCtx: ExtensionContext | null = null;
+  // NOTE: server / wss / clients / latestCtx / mirrorUrl are MODULE-LEVEL (see top).
+  // Do not redeclare them here — session switch re-runs this factory.
 
   /**
    * Arm sidebar resume. NEVER close over ExtensionCommandContext — it goes stale
@@ -592,9 +613,6 @@ export default function (pi: ExtensionAPI) {
     // Default: shallow copy + force type
     return { ...event, type: eventType };
   }
-
-  let mirrorUrl = "";
-  let tailscaleUrl = "";
 
   // ═══════════════════════════════════════
   // Helper: stop the server
@@ -2636,30 +2654,33 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     console.log("[Mirror] Session ended (mirror server kept alive)");
   });
 
-  // Block accidental process.exit only. Do NOT block process.kill(pid, 0) —
-  // that is the standard liveness probe used by getRunningInstances().
-  const realExit = process.exit.bind(process);
-  (process as any).exit = (code?: number) => {
-    console.error(
-      `[Mirror] BLOCKED process.exit(${code ?? 0}) build=${TAU_BUILD_ID}\n` +
-        (new Error().stack || "")
-    );
-  };
+  // Install process.exit guard once (factory may run on every session switch)
+  if (!processExitHookInstalled) {
+    processExitHookInstalled = true;
+    const realExit = process.exit.bind(process);
+    (process as any).exit = (code?: number) => {
+      console.error(
+        `[Mirror] BLOCKED process.exit(${code ?? 0}) build=${TAU_BUILD_ID}\n` +
+          (new Error().stack || "")
+      );
+    };
+    const restoreAndExit = (sig: string) => {
+      console.log(`[Mirror] Received ${sig} — restoring process.exit and shutting down`);
+      process.exit = realExit as typeof process.exit;
+      try { stopServer(); } catch { /* ignore */ }
+      realExit(0);
+    };
+    process.once("SIGINT", () => restoreAndExit("SIGINT"));
+    process.once("SIGTERM", () => restoreAndExit("SIGTERM"));
+  }
 
-  const restoreAndExit = (sig: string) => {
-    console.log(`[Mirror] Received ${sig} — restoring process.exit and shutting down`);
-    process.exit = realExit as typeof process.exit;
-    try { stopServer(); } catch { /* ignore */ }
-    realExit(0);
-  };
-  process.once("SIGINT", () => restoreAndExit("SIGINT"));
-  process.once("SIGTERM", () => restoreAndExit("SIGTERM"));
-
-  let extPath = "unknown";
-  try {
-    extPath = typeof __filename !== "undefined" ? __filename : "esm";
-  } catch { /* ignore */ }
-  console.log(`[Mirror] === TAU BUILD ${TAU_BUILD_ID} loaded ===`);
-  console.log(`[Mirror] extension file: ${extPath}`);
-  console.log(`[Mirror] process.exit intercepted; kill(pid,0) liveness checks OK`);
+  if (factoryInvokeCount === 1) {
+    let extPath = "unknown";
+    try {
+      extPath = typeof __filename !== "undefined" ? __filename : "esm";
+    } catch { /* ignore */ }
+    console.log(`[Mirror] === TAU BUILD ${TAU_BUILD_ID} loaded ===`);
+    console.log(`[Mirror] extension file: ${extPath}`);
+    console.log(`[Mirror] shared clients singleton — streaming survives session switch`);
+  }
 }
