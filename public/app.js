@@ -2529,14 +2529,33 @@ if (splash) {
 
 // ═══════════════════════════════════════
 // Close browser tab → stop Tau port + exit Pi
-// Suppress during resume/new so mid-op pagehide cannot kill TUI.
+// - Suppress during resume/new
+// - Suppress first N seconds after page load (redirect / auto-open races)
+// - Server also has startup grace so OLD tabs cannot kill a fresh Pi
 // ═══════════════════════════════════════
 let browserExitSent = false;
 let suppressBrowserExit = false;
+const pageLoadedAt = Date.now();
+const CLIENT_EXIT_MIN_AGE_MS = 8_000;
+let hadSuccessfulWs = false;
+
+wsClient.addEventListener('connected', () => {
+  hadSuccessfulWs = true;
+});
 
 function requestBrowserCloseShutdown(reason = 'pagehide') {
+  const age = Date.now() - pageLoadedAt;
   if (browserExitSent || suppressBrowserExit) {
     console.log('[Tau] Exit suppressed:', reason, { browserExitSent, suppressBrowserExit });
+    return;
+  }
+  // Early pagehide from refresh/auto-open/old-tab must not kill Pi
+  if (age < CLIENT_EXIT_MIN_AGE_MS) {
+    console.log(`[Tau] Exit ignored — page too young (${age}ms < ${CLIENT_EXIT_MIN_AGE_MS}ms)`);
+    return;
+  }
+  if (!hadSuccessfulWs) {
+    console.log('[Tau] Exit ignored — never had a live WebSocket');
     return;
   }
   browserExitSent = true;
@@ -2568,4 +2587,4 @@ window.addEventListener('pagehide', (e) => {
   requestBrowserCloseShutdown('pagehide');
 });
 
-console.log('[Tau] initialized (safe prompt/new-session; exit on tab close)');
+console.log('[Tau] initialized (safe prompt/new-session; guarded tab-close exit)');

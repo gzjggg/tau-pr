@@ -95,6 +95,10 @@ const AUTH_PASS = TAU_SETTINGS.pass;
 const AUTH_CONFIGURED = !!(AUTH_USER && AUTH_PASS);
 let authEnabled = AUTH_CONFIGURED && TAU_SETTINGS.authEnabled !== false;
 let browserOpenedOnce = false;
+/** ms since mirror server started listening — used to ignore accidental exit beacons */
+let serverStartedAt = 0;
+/** Ignore process.exit from browser for this long after listen (old tabs / auto-open race) */
+const EXIT_GRACE_MS = 25_000;
 // @ts-ignore — __dirname is provided by jiti at runtime
 const STATIC_DIR = process.env.TAU_STATIC_DIR || findPublicDir();
 
@@ -987,17 +991,29 @@ export default function (pi: ExtensionAPI) {
         }
 
         case "shutdown": {
-          const exitProcess = command.exitProcess === true || command.exit === true;
+          let exitProcess = command.exitProcess === true || command.exit === true;
+          const uptime = serverStartedAt ? Date.now() - serverStartedAt : 0;
+          if (exitProcess && uptime < EXIT_GRACE_MS) {
+            console.log(`[Mirror] WS shutdown exit ignored during grace (${uptime}ms)`);
+            exitProcess = false;
+          }
           sendTo(ws, success("shutdown", { stoppingServer: true, exitProcess }));
           setTimeout(() => {
-            if (exitProcess) quitPiProcess(command.reason || "ws_shutdown");
-            else {
+            if (exitProcess) {
+              const live = [...clients].filter((c) => c.readyState === WebSocket.OPEN).length;
+              // This client is closing; allow 0 or 1 (self still open until close completes)
+              if (live > 1) {
+                console.log(`[Mirror] Other clients connected (${live}) — not exiting Pi`);
+                return;
+              }
+              quitPiProcess(command.reason || "ws_shutdown");
+            } else if (uptime >= EXIT_GRACE_MS) {
               try {
                 stopServer();
                 console.log("[Mirror] Server stopped via WS (Pi kept alive)");
               } catch { /* ignore */ }
             }
-          }, 100);
+          }, 150);
           break;
         }
 
@@ -1587,8 +1603,8 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return;
     }
 
-    // Close browser tab → stop mirror (+ optional exit Pi). Default exitProcess=true
-    // when body requests it; beacon without body still stops server only unless exit=1 query.
+    // Close browser tab → stop mirror (+ optional exit Pi).
+    // Guarded: startup grace + other live clients prevent "open then die" races.
     if (urlPath === "/api/shutdown" || barePath === "/api/shutdown") {
       if (req.method === "POST" || req.method === "GET") {
         let body = "";
@@ -1610,13 +1626,38 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
             }
           } catch { /* ignore */ }
 
+          const uptime = serverStartedAt ? Date.now() - serverStartedAt : 0;
+          if (exitProcess && uptime < EXIT_GRACE_MS) {
+            console.log(
+              `[Mirror] Ignoring process exit during startup grace (${uptime}ms < ${EXIT_GRACE_MS}ms, reason=${reason})`
+            );
+            exitProcess = false;
+          }
+
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ok: true, stoppingServer: true, exitProcess, reason }));
+          res.end(JSON.stringify({
+            ok: true,
+            stoppingServer: !exitProcess,
+            exitProcess,
+            reason,
+            graceBlocked: uptime < EXIT_GRACE_MS && reason === "web_ui_closed",
+          }));
 
           setTimeout(() => {
             if (exitProcess) {
+              // Another tab may still be connected (or reconnecting after auto-open)
+              const live = [...clients].filter((c) => c.readyState === WebSocket.OPEN).length;
+              if (live > 0) {
+                console.log(`[Mirror] ${live} browser client(s) still connected — not exiting Pi`);
+                return;
+              }
               quitPiProcess(reason);
             } else {
+              // Do NOT stopServer on spurious early beacons — that kills the new UI mid-load
+              if (uptime < EXIT_GRACE_MS) {
+                console.log(`[Mirror] Ignoring stopServer during startup grace (reason=${reason})`);
+                return;
+              }
               try {
                 stopServer();
                 console.log(`[Mirror] Server stopped (reason: ${reason})`);
@@ -1624,7 +1665,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
                 console.warn("[Mirror] stopServer failed:", e);
               }
             }
-          }, 120);
+          }, 250);
         });
         return;
       }
@@ -2413,6 +2454,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     };
 
     const onListening = (port: number) => {
+      serverStartedAt = Date.now();
       const isLoopback = HOST === "127.0.0.1" || HOST === "::1" || HOST === "localhost";
 
       let localIp = "localhost";
