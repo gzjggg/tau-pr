@@ -59,7 +59,11 @@ export class FileBrowser {
       const data = await res.json();
 
       if (data.error) {
-        this.container.innerHTML = `<div class="file-loading">${data.error}</div>`;
+        this.container.textContent = '';
+        const errEl = document.createElement('div');
+        errEl.className = 'file-loading';
+        errEl.textContent = data.error;
+        this.container.appendChild(errEl);
         return;
       }
 
@@ -101,11 +105,21 @@ export class FileBrowser {
       const icon = getFileIcon(item.name, item.isDirectory);
       const size = item.isDirectory ? '' : formatSize(item.size);
 
-      el.innerHTML = `
-        <span class="file-icon">${icon}</span>
-        <span class="file-name" title="${item.name}">${item.name}</span>
-        ${size ? `<span class="file-size">${size}</span>` : ''}
-      `;
+      const iconSpan = document.createElement('span');
+      iconSpan.className = 'file-icon';
+      iconSpan.textContent = icon;
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'file-name';
+      nameSpan.title = item.name;
+      nameSpan.textContent = item.name;
+      el.appendChild(iconSpan);
+      el.appendChild(nameSpan);
+      if (size) {
+        const sizeSpan = document.createElement('span');
+        sizeSpan.className = 'file-size';
+        sizeSpan.textContent = size;
+        el.appendChild(sizeSpan);
+      }
 
       // Click: navigate directory or insert file path into input
       el.addEventListener('click', () => {

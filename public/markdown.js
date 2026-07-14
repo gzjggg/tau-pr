@@ -264,6 +264,25 @@ export function renderUserMarkdown(text) {
   return html.replace(/\n$/, '');
 }
 
+/** Allow only safe URL schemes for markdown links/images (XSS harden, no UX change for normal URLs). */
+function sanitizeUrl(url) {
+  if (!url || typeof url !== 'string') return null;
+  const trimmed = url.trim().replace(/[\s\x00-\x1f\x7f]/g, '');
+  // Block protocol-relative and dangerous schemes
+  if (trimmed.startsWith('//')) return null;
+  const lower = trimmed.toLowerCase();
+  if (/^(javascript|vbscript|data\s*:)/i.test(lower) && !/^data:image\//i.test(lower)) {
+    return null;
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(trimmed)) {
+    if (/^(https?|mailto):/i.test(trimmed)) return trimmed;
+    if (/^data:image\/(png|jpeg|jpg|gif|webp|svg\+xml);/i.test(trimmed)) return trimmed;
+    return null;
+  }
+  // Relative / path / hash / query — fine for local notes
+  return trimmed;
+}
+
 function renderInline(text) {
   // Inline code (must come first to protect content)
   const codeSpans = [];
@@ -289,44 +308,66 @@ function renderInline(text) {
     return `%%MATHX${idx}%%`;
   });
 
-  // Images (before links so ![...](...) isn't caught by link regex)
-  text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" class="inline-image">');
+  // Images / links → placeholders with sanitized URLs only
+  const mediaSpans = [];
+  text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt, url) => {
+    const safe = sanitizeUrl(url);
+    const idx = mediaSpans.length;
+    if (!safe) {
+      mediaSpans.push(escapeHtml(`![${alt}](${url})`));
+    } else {
+      mediaSpans.push(
+        `<img src="${escapeHtml(safe)}" alt="${escapeHtml(alt)}" class="inline-image">`
+      );
+    }
+    return `%%MEDIA${idx}%%`;
+  });
+  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, url) => {
+    const safe = sanitizeUrl(url);
+    const idx = mediaSpans.length;
+    if (!safe) {
+      mediaSpans.push(escapeHtml(`[${label}](${url})`));
+    } else {
+      mediaSpans.push(
+        `<a href="${escapeHtml(safe)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`
+      );
+    }
+    return `%%MEDIA${idx}%%`;
+  });
 
-  // Bold + italic
+  // Escape remaining plain text so raw HTML / onerror never reaches the DOM
+  text = escapeHtml(text);
+
+  // Bold + italic (safe tags only; content already escaped)
   text = text.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
-
-  // Bold
   text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
   text = text.replace(/__(.+?)__/g, '<strong>$1</strong>');
-
-  // Italic
   text = text.replace(/\*(.+?)\*/g, '<em>$1</em>');
   text = text.replace(/_(.+?)_/g, '<em>$1</em>');
-
-  // Strikethrough
   text = text.replace(/~~(.+?)~~/g, '<del>$1</del>');
 
-  // Links
-  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  // Auto-link bare http(s) URLs only
+  text = text.replace(/(^|[^"'>])(https?:\/\/[^\s<]+)/g, (_, pre, url) => {
+    const safe = sanitizeUrl(url);
+    if (!safe) return pre + url;
+    return `${pre}<a href="${escapeHtml(safe)}" target="_blank" rel="noopener noreferrer">${escapeHtml(safe)}</a>`;
+  });
 
-  // Auto-link bare URLs
-  text = text.replace(/(^|[^"'])(https?:\/\/[^\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
-
-  // Restore math (before inline code so math inside code stays as code)
+  // Restore media, math, inline code
+  text = text.replace(/%%MEDIA(\d+)%%/g, (_, idx) => mediaSpans[parseInt(idx)]);
   text = text.replace(/%%MATHX(\d+)%%/g, (_, idx) => mathSpans[parseInt(idx)]);
-
-  // Restore inline code
   text = text.replace(/%%ICODE(\d+)%%/g, (_, idx) => codeSpans[parseInt(idx)]);
 
   return text;
 }
 
 function escapeHtml(text) {
-  return text
+  return String(text)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // Global copy function for code blocks

@@ -144,11 +144,28 @@ pi install git:github.com/gzjggg/tau
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `TAU_MIRROR_PORT` | `38471` | 服务端口（刻意避开常见端口） |
-| `TAU_HOST` | `0.0.0.0` | 绑定地址；仅本机可设 `127.0.0.1` |
+| `TAU_HOST` | `127.0.0.1` | 绑定地址（默认仅本机） |
+| `TAU_REMOTE` | `0` | 设为 `1` 允许局域网/手机访问（默认 `0.0.0.0`，除非另设 `TAU_HOST`） |
 | `TAU_AUTO_OPEN` | `1` | 设为 `0` 跳过自动打开浏览器 |
 | `TAU_STATIC_DIR` | *内置* | 覆盖静态资源路径 |
 | `TAU_DISABLED` | `0` | 设为 `1` 安装但不自动启动 |
 | `TAU_USER` / `TAU_PASS` | *无* | HTTP Basic Auth（需同时设置） |
+
+### 网络（个人工具默认）
+
+默认 **仅监听本机**（`127.0.0.1`），本机浏览器用法与原来一致。
+
+需要手机同 Wi‑Fi 或局域网其它设备时，**显式打开远程**：
+
+```bash
+# 环境变量
+set TAU_REMOTE=1
+# 或在 settings.json 写 "remote": true
+```
+
+若直接设置 `TAU_HOST=0.0.0.0`（或其它非 loopback 地址），也会视为开启远程（兼容旧配置）。
+
+文件树与会话删除限制在工作区 / sessions 目录内，正常 UI 路径不受影响。
 
 ### `settings.json`（`~/.pi/agent/settings.json`）
 
@@ -157,6 +174,7 @@ pi install git:github.com/gzjggg/tau
   "packages": ["C:/path/to/tau"],
   "tau": {
     "port": 38471,
+    "remote": true,
     "autoOpenBrowser": true,
     "allowRemoteCommandExecution": false,
     "user": "pi",
@@ -166,6 +184,7 @@ pi install git:github.com/gzjggg/tau
 }
 ```
 
+- **`remote`**：设为 `true`（或 `{ "enabled": true }`）以允许局域网/Tailscale/手机；默认仅本机  
 - **`allowRemoteCommandExecution`**：未启用认证时，仅本地客户端可执行命令，除非设为 `true`  
 - **Basic Auth**：配置 `user` + `pass` 后，在设置里打开「Require login」，或设置 `authEnabled`  
 

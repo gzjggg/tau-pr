@@ -13,7 +13,7 @@
  *
  * NEVER call process.exit from this file — browser close must not kill Pi.
  */
-const TAU_BUILD_ID = "tau-2026-07-14-quiet-model-v10";
+const TAU_BUILD_ID = "tau-2026-07-14-safe-b-v1";
 
 /** Routine logs only when TAU_DEBUG=1 (keeps TUI clean) */
 const TAU_DEBUG =
@@ -44,10 +44,16 @@ import {
   type PiCommandAdapter,
 } from "./pi-command-adapter";
 
+function isLoopbackHost(host: string): boolean {
+  const h = (host || "").trim().toLowerCase();
+  return h === "127.0.0.1" || h === "::1" || h === "localhost";
+}
+
 // Load tau settings from ~/.pi/agent/settings.json (falls back to env vars)
 function loadTauSettings(): {
   port: number;
   host: string;
+  remoteEnabled: boolean;
   autoStart: boolean;
   autoOpenBrowser: boolean;
   user: string;
@@ -78,10 +84,39 @@ function loadTauSettings(): {
       : exitEnv === "0" || exitEnv === "false"
         ? false
         : settings.exitOnBrowserClose === true;
+
+  // B: default loopback; LAN/phone only when remote is explicitly enabled.
+  // Compat: an explicit non-loopback host (env or settings) also enables remote.
+  const remoteEnv = process.env.TAU_REMOTE;
+  const remoteFromEnv = remoteEnv === "1" || remoteEnv === "true";
+  const remoteFromSettings =
+    settings.remote === true ||
+    settings.remoteEnabled === true ||
+    (settings.remote && typeof settings.remote === "object" && settings.remote.enabled === true);
+  const explicitHost = process.env.TAU_HOST || settings.host;
+  const hostImpliesRemote =
+    typeof explicitHost === "string" &&
+    explicitHost.length > 0 &&
+    !isLoopbackHost(explicitHost);
+  const remoteEnabled = !!(remoteFromEnv || remoteFromSettings || hostImpliesRemote);
+
+  let host: string;
+  if (remoteEnabled) {
+    // Original-style LAN default when remote is on
+    host = (process.env.TAU_HOST || settings.host || "0.0.0.0") as string;
+  } else {
+    const preferred = process.env.TAU_HOST || settings.host;
+    host =
+      typeof preferred === "string" && isLoopbackHost(preferred)
+        ? preferred
+        : "127.0.0.1";
+  }
+
   return {
     // 38471 — uncommon port to avoid clashes with typical dev servers (3000/3001/5173…)
     port: parseInt(process.env.TAU_MIRROR_PORT || String(settings.port || "38471"), 10),
-    host: process.env.TAU_HOST || settings.host || "0.0.0.0",
+    host,
+    remoteEnabled,
     autoStart: !(
       process.env.TAU_DISABLED === "1" || process.env.TAU_DISABLED === "true" ||
       settings.disabled === true
@@ -114,6 +149,7 @@ function openInBrowser(url: string): void {
 const TAU_SETTINGS = loadTauSettings();
 const PORT = TAU_SETTINGS.port;
 const HOST = TAU_SETTINGS.host;
+const TAU_REMOTE_ENABLED = TAU_SETTINGS.remoteEnabled;
 const TAU_AUTO_START = TAU_SETTINGS.autoStart;
 const TAU_AUTO_OPEN = TAU_SETTINGS.autoOpenBrowser;
 const AUTH_USER = TAU_SETTINGS.user;
@@ -195,6 +231,81 @@ const USER_HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const PI_AGENT_DIR = process.env.PI_CODING_AGENT_DIR || path.join(USER_HOME, ".pi", "agent");
 const SESSIONS_DIR = process.env.PI_CODING_AGENT_SESSION_DIR || path.join(PI_AGENT_DIR, "sessions");
 const INSTANCES_DIR = path.join(USER_HOME, ".pi", "tau-instances");
+
+/** Resolve path; use realpath when the target exists (defeats symlink escape). */
+function resolveExistingPath(p: string): string {
+  const resolved = path.resolve(p);
+  try {
+    if (fs.existsSync(resolved)) return fs.realpathSync(resolved);
+  } catch { /* keep resolved */ }
+  return resolved;
+}
+
+/** True if target is root or a descendant of root (after resolve/realpath). */
+function isPathInsideRoot(targetPath: string, rootPath: string): boolean {
+  const target = resolveExistingPath(targetPath);
+  let root = path.resolve(rootPath);
+  try {
+    if (fs.existsSync(root)) root = fs.realpathSync(root);
+  } catch { /* keep */ }
+  const rel = path.relative(root, target);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+/** Workspace roots for file list/preview/open — session cwd + process.cwd (+ projectsDir). */
+function getWorkspaceRoots(): string[] {
+  const roots = new Set<string>();
+  roots.add(path.resolve(process.cwd()));
+  try {
+    const ctxCwd = (latestCtx as any)?.cwd;
+    if (typeof ctxCwd === "string" && ctxCwd) roots.add(path.resolve(ctxCwd));
+  } catch { /* ignore */ }
+  try {
+    if (latestCtx) {
+      const entries = latestCtx.sessionManager.getEntries();
+      const sessionEntry = entries.find((e: any) => e.type === "session");
+      if (sessionEntry?.cwd) roots.add(path.resolve(sessionEntry.cwd));
+    }
+  } catch { /* ignore */ }
+  if (TAU_SETTINGS.projectsDir) {
+    const raw = TAU_SETTINGS.projectsDir;
+    const expanded = raw.startsWith("~")
+      ? path.join(USER_HOME || "", raw.slice(1))
+      : raw;
+    roots.add(path.resolve(expanded));
+  }
+  return [...roots];
+}
+
+function assertUnderWorkspace(filePath: string): { ok: true; path: string } | { ok: false; error: string } {
+  const resolved = resolveExistingPath(filePath);
+  const roots = getWorkspaceRoots();
+  if (roots.some((root) => isPathInsideRoot(resolved, root))) {
+    return { ok: true, path: resolved };
+  }
+  return { ok: false, error: "Path outside workspace" };
+}
+
+function assertSessionFile(filePath: string): { ok: true; path: string } | { ok: false; error: string } {
+  if (!filePath || typeof filePath !== "string") {
+    return { ok: false, error: "filePath required" };
+  }
+  const resolved = resolveExistingPath(filePath);
+  if (!isPathInsideRoot(resolved, SESSIONS_DIR)) {
+    return { ok: false, error: "Path outside sessions directory" };
+  }
+  if (path.extname(resolved).toLowerCase() !== ".jsonl") {
+    return { ok: false, error: "Not a session file" };
+  }
+  try {
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+      return { ok: false, error: "Session not found" };
+    }
+  } catch {
+    return { ok: false, error: "Session not found" };
+  }
+  return { ok: true, path: resolved };
+}
 
 // Instance registry — tracks all running Tau servers
 function registerInstance(port: number, sessionFile: string, cwd: string) {
@@ -1625,11 +1736,17 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         res.end(JSON.stringify({ error: "path required" }));
         return;
       }
+      const scoped = assertUnderWorkspace(filePath);
+      if (!scoped.ok) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: scoped.error }));
+        return;
+      }
       const IMAGE_PREVIEW_MIMES: Record<string, string> = {
         png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
         gif: "image/gif", webp: "image/webp", svg: "image/svg+xml", ico: "image/x-icon",
       };
-      const ext = path.extname(filePath).toLowerCase().slice(1);
+      const ext = path.extname(scoped.path).toLowerCase().slice(1);
       const mimeType = IMAGE_PREVIEW_MIMES[ext];
       if (!mimeType) {
         res.writeHead(415, { "Content-Type": "application/json" });
@@ -1637,10 +1754,10 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         return;
       }
       try {
-        const stat = fs.statSync(filePath);
+        const stat = fs.statSync(scoped.path);
         if (!stat.isFile()) throw new Error("Not a file");
         res.writeHead(200, { "Content-Type": mimeType, "Cache-Control": "max-age=60" });
-        fs.createReadStream(filePath).pipe(res);
+        fs.createReadStream(scoped.path).pipe(res);
       } catch (err: any) {
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -1719,7 +1836,13 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
             if (sessionEntry?.cwd) dirPath = sessionEntry.cwd;
           } catch {}
         }
-        serveFileList(res, dirPath);
+        const scoped = assertUnderWorkspace(dirPath);
+        if (!scoped.ok) {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: scoped.error }));
+          return;
+        }
+        serveFileList(res, scoped.path);
       } catch (err: any) {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -1739,19 +1862,26 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
             res.end(JSON.stringify({ error: "filePath required" }));
             return;
           }
+          const scoped = assertUnderWorkspace(fp);
+          if (!scoped.ok) {
+            res.writeHead(403, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: scoped.error }));
+            return;
+          }
+          const openPath = scoped.path;
           const { execFile } = await import("node:child_process");
           if (process.platform === "win32") {
             const { exec } = await import("node:child_process");
-            const safe = fp.replace(/'/g, "''").replace(/"/g, '');
+            const safe = openPath.replace(/'/g, "''").replace(/"/g, '');
             exec(`powershell -NoProfile -WindowStyle Hidden -Command "& { $wsh = New-Object -ComObject WScript.Shell; $wsh.Run('explorer \\"${safe}\\"', 1, $false) }"`, (err) => {
               if (err) console.error("[Mirror] open failed:", err.message);
             });
           } else if (process.platform === "darwin") {
-            execFile("open", [fp], (err) => {
+            execFile("open", [openPath], (err) => {
               if (err) console.error("[Mirror] open failed:", err.message);
             });
           } else {
-            execFile("xdg-open", [fp], (err) => {
+            execFile("xdg-open", [openPath], (err) => {
               if (err) console.error("[Mirror] open failed:", err.message);
             });
           }
@@ -2050,24 +2180,24 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return;
     }
 
-    // Session delete
+    // Session delete — only .jsonl under SESSIONS_DIR (frontend still sends filePath)
     if (urlPath === "/api/sessions/delete" && req.method === "POST") {
       let body = "";
       req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
       req.on("end", () => {
         try {
           const { filePath } = JSON.parse(body);
-          if (!filePath || typeof filePath !== "string") {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "filePath required" }));
+          const checked = assertSessionFile(filePath);
+          if (!checked.ok) {
+            const status =
+              checked.error === "Session not found" ? 404
+                : checked.error === "filePath required" ? 400
+                  : 403;
+            res.writeHead(status, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: checked.error }));
             return;
           }
-          if (!fs.existsSync(filePath)) {
-            res.writeHead(404, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Session not found" }));
-            return;
-          }
-          fs.unlinkSync(filePath);
+          fs.unlinkSync(checked.path);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ success: true }));
         } catch (err: any) {
@@ -2665,7 +2795,11 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       mirrorUrl = `http://${localIp}:${port}`;
       tailscaleUrl = tailscaleIp ? `http://${tailscaleIp}:${port}` : "";
       // Compact status for TUI (avoid multi-line spam)
-      console.log(`[Mirror] ${mirrorUrl}${tailscaleUrl ? ` · TS ${tailscaleUrl}` : ""}`);
+      if (TAU_REMOTE_ENABLED) {
+        console.log(`[Mirror] ${mirrorUrl}${tailscaleUrl ? ` · TS ${tailscaleUrl}` : ""} (remote)`);
+      } else {
+        console.log(`[Mirror] ${mirrorUrl} (loopback; TAU_REMOTE=1 or tau.remote=true for LAN)`);
+      }
       try {
         ctx.ui.setStatus("mirror", `τ:${port}`);
       } catch { /* ignore */ }

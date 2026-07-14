@@ -144,11 +144,28 @@ Click a session in the sidebar to switch the live Pi TUI session via `switchSess
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TAU_MIRROR_PORT` | `38471` | Server port (uncommon by design) |
-| `TAU_HOST` | `0.0.0.0` | Bind address; use `127.0.0.1` for localhost only |
+| `TAU_HOST` | `127.0.0.1` | Bind address (loopback by default) |
+| `TAU_REMOTE` | `0` | Set `1` to allow LAN/phone (`0.0.0.0` unless `TAU_HOST` is set) |
 | `TAU_AUTO_OPEN` | `1` | Set `0` to skip opening the browser |
 | `TAU_STATIC_DIR` | *(bundled)* | Override static files path |
 | `TAU_DISABLED` | `0` | Set `1` to keep Tau installed but not auto-start |
 | `TAU_USER` / `TAU_PASS` | *(none)* | HTTP Basic Auth (both required) |
+
+### Network (personal-tool defaults)
+
+By default Tau listens on **loopback only** (`127.0.0.1`). Same-machine browser use is unchanged.
+
+To use a phone on the same Wi‑Fi or another device on the LAN, **explicitly enable remote**:
+
+```bash
+# environment
+set TAU_REMOTE=1
+# or permanently in settings.json: "remote": true
+```
+
+Setting `TAU_HOST=0.0.0.0` (or any non-loopback host) also enables remote for compatibility.
+
+File browser and session delete stay limited to the workspace / sessions directory so ordinary UI paths keep working.
 
 ### `settings.json` (`~/.pi/agent/settings.json`)
 
@@ -157,6 +174,7 @@ Click a session in the sidebar to switch the live Pi TUI session via `switchSess
   "packages": ["C:/path/to/tau"],
   "tau": {
     "port": 38471,
+    "remote": true,
     "autoOpenBrowser": true,
     "allowRemoteCommandExecution": false,
     "user": "pi",
@@ -166,6 +184,7 @@ Click a session in the sidebar to switch the live Pi TUI session via `switchSess
 }
 ```
 
+- **`remote`**: set `true` (or `{ "enabled": true }`) for LAN/Tailscale/phone access; default is loopback-only
 - **`allowRemoteCommandExecution`**: when auth is off, only local clients may run commands unless this is `true`
 - **Basic Auth**: set `user` + `pass`, then enable “Require login” in Settings (or set `authEnabled`)
 
