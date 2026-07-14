@@ -98,7 +98,7 @@ pi install git:github.com/gzjggg/tau
 ### UI
 
 - 更大字号与更强强调色  
-- 像素品牌标（黑身 **34×36**，白底画布）  
+- 像素品牌标 
 - 浅色主题链接 / 技能样式优化  
 - 斜杠输入双色显示（透明 textarea + 底层镜像 + 实色气泡）  
 
@@ -214,7 +214,6 @@ Remove-Item "$env:LOCALAPPDATA\Temp\jiti" -Recurse -Force -ErrorAction SilentlyC
 
 - 上游：[deflating/tau](https://github.com/deflating/tau)  
 - Pi：[badlogic/pi-mono](https://github.com/badlogic/pi-mono)  
-- 会话封面灵感来自 pi-ui-hephaestus / pi-archimedes  
 
 ## 许可证
 
