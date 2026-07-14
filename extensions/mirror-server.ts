@@ -13,7 +13,7 @@
  *
  * NEVER call process.exit from this file — browser close must not kill Pi.
  */
-const TAU_BUILD_ID = "tau-2026-07-14-fix-activePi-v8";
+const TAU_BUILD_ID = "tau-2026-07-14-polish-v9";
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { WebSocketServer, WebSocket } from "ws";
@@ -507,8 +507,21 @@ export default function (pi: ExtensionAPI) {
         ? Math.round((Number(tokens) / Number(contextWindow)) * 100)
         : usage?.percent;
 
+    let sessionName: string | undefined;
+    let thinkingLevel: string | undefined;
+    try {
+      const api = getApi();
+      sessionName = api.getSessionName?.() || undefined;
+      thinkingLevel = api.getThinkingLevel?.() as string | undefined;
+    } catch {
+      try {
+        sessionName = pi.getSessionName?.() || undefined;
+        thinkingLevel = pi.getThinkingLevel?.() as string | undefined;
+      } catch { /* ignore */ }
+    }
+
     return {
-      sessionName: pi.getSessionName?.() || undefined,
+      sessionName,
       cwd,
       projectName: path.basename(cwd),
       model: model
@@ -518,7 +531,7 @@ export default function (pi: ExtensionAPI) {
             displayName: model.name || model.id,
           }
         : undefined,
-      thinkingLevel: pi.getThinkingLevel?.(),
+      thinkingLevel,
       contextUsage: {
         tokens: tokens != null ? Number(tokens) : undefined,
         contextWindow: contextWindow != null ? Number(contextWindow) : undefined,
@@ -787,19 +800,21 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_end", async (_event, _ctx) => {
     if (titleSet || turnCount < 2) return;
 
-    const sessionName = pi.getSessionName();
-    if (sessionName && sessionName !== "New Session" && sessionName !== "Untitled") {
-      titleSet = true;
-      return;
-    }
-
-    // Generate title from collected messages
-    const title = generateSessionTitle(userMessages);
-    if (title) {
-      pi.setSessionName(title);
-      titleSet = true;
-      // Broadcast to connected clients
-      broadcast({ type: "event", event: { type: "session_name", name: title } });
+    try {
+      const api = getApi();
+      const sessionName = api.getSessionName();
+      if (sessionName && sessionName !== "New Session" && sessionName !== "Untitled") {
+        titleSet = true;
+        return;
+      }
+      const title = generateSessionTitle(userMessages);
+      if (title) {
+        api.setSessionName(title);
+        titleSet = true;
+        broadcast({ type: "event", event: { type: "session_name", name: title } });
+      }
+    } catch (e) {
+      console.warn("[Mirror] auto-title skipped:", e);
     }
   });
 
@@ -855,18 +870,26 @@ export default function (pi: ExtensionAPI) {
   // Build state snapshot for new connections
   // ═══════════════════════════════════════
   async function buildStateSnapshot(ctx: ExtensionContext) {
-    // Get session entries for message history
     const entries = ctx.sessionManager.getEntries();
-
-    // Get model info
     const model = ctx.model;
-    const thinkingLevel = pi.getThinkingLevel();
-    const sessionName = pi.getSessionName();
     const sessionFile = ctx.sessionManager.getSessionFile();
-
-    // Context usage
     const contextUsage = ctx.getContextUsage();
-    refreshSessionCapture(ctx, pi as any);
+
+    // Prefer live API (survives session switch); fall back to factory pi
+    let thinkingLevel: string | undefined;
+    let sessionName: string | undefined;
+    try {
+      const api = getApi();
+      thinkingLevel = api.getThinkingLevel() as string;
+      sessionName = api.getSessionName();
+      refreshSessionCapture(ctx, api as any);
+    } catch {
+      try {
+        thinkingLevel = pi.getThinkingLevel() as string;
+        sessionName = pi.getSessionName();
+        refreshSessionCapture(ctx, pi as any);
+      } catch { /* ignore */ }
+    }
 
     let commands: CommandDescriptor[] = [];
     let adapterInfo = commandAdapter.info();
@@ -878,6 +901,9 @@ export default function (pi: ExtensionAPI) {
 
     const sessionCover = await buildSessionCover(ctx);
 
+    let isStreaming = false;
+    try { isStreaming = !ctx.isIdle(); } catch { isStreaming = false; }
+
     return {
       type: "mirror_sync",
       entries,
@@ -886,7 +912,7 @@ export default function (pi: ExtensionAPI) {
       sessionName,
       sessionFile,
       cwd: sessionCover?.cwd || (ctx as any)?.cwd || process.cwd(),
-      isStreaming: !ctx.isIdle(),
+      isStreaming,
       contextUsage,
       commands,
       sessionCover,
@@ -1308,12 +1334,16 @@ export default function (pi: ExtensionAPI) {
             const next = levels[(idx + 1) % levels.length];
             piApi.setThinkingLevel(next as any);
             const actual = piApi.getThinkingLevel();
+            // Keep other tabs / header in sync
+            broadcast({
+              type: "event",
+              event: { type: "thinking_level_changed", level: actual },
+            });
             sendTo(ws, success("cycle_thinking_level", { level: actual }));
           } catch (e: any) {
-            sendTo(ws, error(
-              "cycle_thinking_level",
-              e?.message || String(e)
-            ));
+            const msg = e?.message || String(e);
+            console.warn("[Mirror] cycle_thinking_level failed:", msg);
+            sendTo(ws, error("cycle_thinking_level", msg));
           }
           break;
         }
@@ -1321,9 +1351,12 @@ export default function (pi: ExtensionAPI) {
         case "set_thinking_level": {
           try {
             piApi.setThinkingLevel(command.level);
-            sendTo(ws, success("set_thinking_level", {
-              level: piApi.getThinkingLevel(),
-            }));
+            const actual = piApi.getThinkingLevel();
+            broadcast({
+              type: "event",
+              event: { type: "thinking_level_changed", level: actual },
+            });
+            sendTo(ws, success("set_thinking_level", { level: actual }));
           } catch (e: any) {
             sendTo(ws, error("set_thinking_level", e?.message || String(e)));
           }
@@ -2710,26 +2743,8 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     console.log("[Mirror] Session ended (mirror server kept alive)");
   });
 
-  // Install process.exit guard once (factory may run on every session switch)
-  if (!processExitHookInstalled) {
-    processExitHookInstalled = true;
-    const realExit = process.exit.bind(process);
-    (process as any).exit = (code?: number) => {
-      console.error(
-        `[Mirror] BLOCKED process.exit(${code ?? 0}) build=${TAU_BUILD_ID}\n` +
-          (new Error().stack || "")
-      );
-    };
-    const restoreAndExit = (sig: string) => {
-      console.log(`[Mirror] Received ${sig} — restoring process.exit and shutting down`);
-      process.exit = realExit as typeof process.exit;
-      try { stopServer(); } catch { /* ignore */ }
-      realExit(0);
-    };
-    process.once("SIGINT", () => restoreAndExit("SIGINT"));
-    process.once("SIGTERM", () => restoreAndExit("SIGTERM"));
-  }
-
+  // Do NOT intercept process.exit permanently — that breaks Pi /quit.
+  // Browser close already cannot kill Pi (/api/shutdown is a no-op for exit).
   if (factoryInvokeCount === 1) {
     let extPath = "unknown";
     try {
@@ -2737,6 +2752,6 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     } catch { /* ignore */ }
     console.log(`[Mirror] === TAU BUILD ${TAU_BUILD_ID} loaded ===`);
     console.log(`[Mirror] extension file: ${extPath}`);
-    console.log(`[Mirror] shared clients singleton — streaming survives session switch`);
+    console.log(`[Mirror] shared clients + activePi — streaming & thinking survive session switch`);
   }
 }

@@ -324,6 +324,14 @@ function handleRPCEvent(event) {
         if (activeItem) activeItem.textContent = event.name;
       }
       break;
+    case 'thinking_level_changed':
+      if (event.level) {
+        currentThinkingLevel = event.level;
+        updateThinkingBtn();
+        const btn = document.getElementById('btn-thinking-level');
+        if (btn) btn.textContent = event.level;
+      }
+      break;
   }
 }
 
@@ -1213,6 +1221,15 @@ thinkingBtn.addEventListener('click', async () => {
   if (data?.success && data.data?.level) {
     currentThinkingLevel = data.data.level;
     updateThinkingBtn();
+  } else if (data && data.success === false) {
+    const err = data.error || 'Failed to change thinking level';
+    statusText.textContent = 'Thinking failed';
+    messageRenderer.renderSystemMessage(
+      /stale/i.test(err)
+        ? 'Could not change thinking level (session context outdated). Try again or restart Pi.'
+        : `Could not change thinking level: ${err}`
+    );
+    setTimeout(() => { statusText.textContent = 'Connected'; }, 3000);
   }
 });
 
@@ -2206,11 +2223,15 @@ toggleAutoCompact.addEventListener('click', async () => {
 
 // Thinking level cycle (settings panel button)
 btnThinkingLevel.addEventListener('click', async () => {
-  const data = await rpcCommand({ type: 'cycle_thinking_level' });
+  const data = await rpcCommand({ type: 'cycle_thinking_level' }, 'Cycling thinking...');
   if (data?.success && data.data?.level) {
     btnThinkingLevel.textContent = data.data.level;
     currentThinkingLevel = data.data.level;
     updateThinkingBtn();
+  } else if (data && data.success === false) {
+    messageRenderer.renderSystemMessage(
+      `Could not change thinking level: ${data.error || 'unknown error'}`
+    );
   }
 });
 
