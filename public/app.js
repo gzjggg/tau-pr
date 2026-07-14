@@ -1380,12 +1380,13 @@ async function handleSessionSelect(session, project) {
  * 5. If same-cwd live switch fails → fall back to read-only history browse
  */
 function sessionBelongsToLiveCwd(project, sessionFile) {
-  // Prefer project.path from sidebar grouping
+  // Already the live session
+  if (sessionFile && sessionFile === mirrorActiveSessionFile) return true;
+  // Prefer project.path from sidebar grouping vs live Pi cwd
   if (project?.path && mirrorActiveCwd) {
     return pathsEqual(project.path, mirrorActiveCwd);
   }
-  // If we don't know live cwd yet, allow live switch attempt only when project path missing
-  if (!mirrorActiveCwd) return true;
+  // Unknown live cwd → never live-switch (avoids Pi cwd prompts / process churn)
   return false;
 }
 
@@ -1397,6 +1398,9 @@ async function openSessionReadOnly(session, project, notice) {
 }
 
 async function switchSession(sessionFile, session = null, project = null) {
+  // Prevent tab-close shutdown handlers from firing during session ops
+  // (pagehide can spuriously run when the WS/HTTP stack blips)
+  suppressPiShutdown = true;
   try {
     // Clear any streaming state from previous session to prevent bleed
     currentStreamingElement = null;
@@ -1459,17 +1463,17 @@ async function switchSession(sessionFile, session = null, project = null) {
         return;
       }
 
-      // Different project directory → read-only only (Pi /resume would prompt on missing cwd)
+      // Different project directory (or unknown cwd) → read-only only
       if (!sessionBelongsToLiveCwd(project, sessionFile)) {
         await openSessionReadOnly(
           session,
           project,
-          'Other directory session — read-only. Live switch is limited to the current working directory to avoid Pi cwd confirmation prompts.'
+          'Other directory session — read-only. Live switch is limited to the current working directory.'
         );
         return;
       }
 
-      // Same cwd: ask Pi to switch the live session
+      // Same cwd: ask Pi to switch the live session (server stays up across switch)
       messageRenderer.renderSystemMessage('Switching Pi session…');
       statusText.textContent = 'Switching session…';
       try {
@@ -1480,8 +1484,9 @@ async function switchSession(sessionFile, session = null, project = null) {
           updateMirrorInputState();
           statusText.textContent = 'Session switched';
           setTimeout(() => { statusText.textContent = 'Connected'; }, 1500);
-          setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 250);
-          setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 800);
+          // session_start broadcasts mirror_sync; request again as a safety net
+          setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 300);
+          setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 900);
           return;
         }
         console.warn('[App] Live switch failed, opening read-only:', switched.error);
@@ -1517,6 +1522,9 @@ async function switchSession(sessionFile, session = null, project = null) {
   } catch (error) {
     console.error('[App] Failed to switch session:', error);
     messageRenderer.renderError('Failed to switch session');
+  } finally {
+    // Keep suppress briefly so late pagehide from WS blip cannot kill Pi
+    setTimeout(() => { suppressPiShutdown = false; }, 2500);
   }
 }
 
@@ -1525,14 +1533,27 @@ async function loadSessionHistory(session, project) {
     messageRenderer.renderWelcome();
     return;
   }
-  const dirName = project?.dirName;
-  const file = session.file;
+  // Prefer explicit dirName; fall back to parent folder of filePath
+  let dirName = project?.dirName;
+  let file = session.file;
+  if ((!dirName || !file) && session.filePath) {
+    const parts = session.filePath.replace(/\\/g, '/').split('/');
+    file = file || parts.pop();
+    // Pi sessions live in ~/.pi/agent/sessions/<dirName>/<file>
+    // dirName is the last path segment of the parent folder
+    if (!dirName && parts.length) dirName = parts[parts.length - 1];
+  }
   if (!dirName || !file) {
     messageRenderer.renderSystemMessage('Session path incomplete — cannot load history.');
     return;
   }
   try {
-    const res = await fetch(`/api/sessions/${dirName}/${file}`);
+    const res = await fetch(`/api/sessions/${encodeURIComponent(dirName)}/${encodeURIComponent(file)}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      messageRenderer.renderError(err.error || `Failed to load history (${res.status})`);
+      return;
+    }
     const data = await res.json();
     messageRenderer.clear();
     renderSessionHistory(data.entries || []);
@@ -2351,10 +2372,17 @@ if (splash) {
 
 // ═══════════════════════════════════════
 // Close Web UI → stop Tau port + exit Pi process
+// Only on real tab/window close — never during session switch or bfcache.
 // ═══════════════════════════════════════
 let piShutdownSent = false;
+/** Set true while switching sessions so a WS blip cannot kill Pi */
+let suppressPiShutdown = false;
+
 function requestPiShutdown(reason = 'web_ui_closed') {
-  if (piShutdownSent) return;
+  if (piShutdownSent || suppressPiShutdown) {
+    console.log('[Tau] Shutdown suppressed:', reason, { piShutdownSent, suppressPiShutdown });
+    return;
+  }
   piShutdownSent = true;
   const payload = JSON.stringify({ reason });
 
@@ -2382,7 +2410,18 @@ function requestPiShutdown(reason = 'web_ui_closed') {
   } catch { /* ignore */ }
 }
 
-window.addEventListener('pagehide', () => requestPiShutdown('pagehide'));
-window.addEventListener('beforeunload', () => requestPiShutdown('beforeunload'));
+// pagehide is the reliable "tab really going away" signal.
+// Skip bfcache freezes (persisted) — those are not real closes.
+window.addEventListener('pagehide', (e) => {
+  if (e.persisted) return;
+  requestPiShutdown('pagehide');
+});
+
+// beforeunload is noisier (mobile, some navigations). Only use as backup when
+// the document is being unloaded and we are not mid session-switch.
+window.addEventListener('beforeunload', () => {
+  if (suppressPiShutdown) return;
+  requestPiShutdown('beforeunload');
+});
 
 console.log('[Tau] initialized');

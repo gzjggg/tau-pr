@@ -141,12 +141,13 @@ function registerInstance(port: number, sessionFile: string, cwd: string) {
   fs.writeFileSync(path.join(INSTANCES_DIR, `${process.pid}.json`), JSON.stringify(info));
 }
 
-function updateInstanceSession(sessionFile: string) {
+function updateInstanceSession(sessionFile: string, cwd?: string) {
   const file = path.join(INSTANCES_DIR, `${process.pid}.json`);
   if (!fs.existsSync(file)) return;
   try {
     const info = JSON.parse(fs.readFileSync(file, "utf8"));
     info.sessionFile = sessionFile;
+    if (cwd) info.cwd = cwd;
     fs.writeFileSync(file, JSON.stringify(info));
   } catch {}
 }
@@ -1466,9 +1467,13 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     }
 
     // Session file endpoint: /api/sessions/:dirName/:file
-    const sessionMatch = urlPath.match(/^\/api\/sessions\/([^/]+)\/([^/]+)$/);
+    const sessionMatch = (urlPath.split("?")[0] || "").match(/^\/api\/sessions\/([^/]+)\/([^/]+)$/);
     if (sessionMatch && req.method === "GET") {
-      serveSessionFile(res, sessionMatch[1], sessionMatch[2]);
+      let dirName = sessionMatch[1];
+      let file = sessionMatch[2];
+      try { dirName = decodeURIComponent(dirName); } catch { /* keep raw */ }
+      try { file = decodeURIComponent(file); } catch { /* keep raw */ }
+      serveSessionFile(res, dirName, file);
       return;
     }
 
@@ -2233,6 +2238,23 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return;
     }
 
+    const sessionFile = ctx.sessionManager.getSessionFile() || "";
+    const cwd = (ctx as any).cwd || process.cwd();
+
+    // Server already up (e.g. after live session switch) — rebind identity + push snapshot.
+    // Do NOT restart the HTTP/WS stack; that drops browser clients mid-switch.
+    if (server) {
+      updateInstanceSession(sessionFile, cwd);
+      console.log(`[Mirror] Session start (server already running) → ${sessionFile || "(no file)"}`);
+      try {
+        const snapshot = await buildStateSnapshot(ctx);
+        broadcast(snapshot);
+      } catch (e) {
+        console.warn("[Mirror] Failed to broadcast post-switch snapshot:", e);
+      }
+      return;
+    }
+
     if (!TAU_AUTO_START) {
       console.log("[Mirror] Tau auto-start disabled (TAU_DISABLED=1). Use /tau-start to start manually.");
       return;
@@ -2270,7 +2292,11 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   }
 
   pi.on("session_shutdown", async () => {
-    stopServer();
-    console.log("[Mirror] Server shut down");
+    // CRITICAL: do NOT stopServer() here.
+    // Pi fires session_shutdown on every session switch (/resume, switchSession), not only
+    // when the process is exiting. Stopping the mirror mid-switch drops all browser clients,
+    // aborts in-flight /api/sessions/switch, and leaves the UI looking like a hard failure.
+    // Real teardown: /taustop, /api/shutdown (web tab close), or process exit.
+    console.log("[Mirror] Session ended (mirror server kept alive for live switch)");
   });
 }
