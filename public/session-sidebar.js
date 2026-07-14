@@ -2,11 +2,38 @@
  * Session Sidebar - Lists sessions grouped by project, handles switching
  */
 
+/**
+ * Normalize paths for equality checks.
+ * Handles Windows drive letters, mixed slashes, and Pi session-dir decoding
+ * (e.g. dir "--C--Users-14868--" → "/C//Users/14868").
+ */
+export function normalizePath(p) {
+  if (!p || typeof p !== 'string') return '';
+  let s = p.trim()
+    .replace(/^\\\\\?\\/, '')
+    .replace(/\\/g, '/')
+    .replace(/\/+/g, '/');
+  // Pi decode may yield "/C/Users/..." or "C/Users/..." (missing colon)
+  const driveAbs = s.match(/^\/?([a-zA-Z])\/(.*)$/);
+  if (driveAbs) s = `${driveAbs[1]}:/${driveAbs[2]}`;
+  // Also normalize "C:/..." forms already correct
+  s = s.replace(/\/+$/, '');
+  return s.toLowerCase();
+}
+
+export function pathsEqual(a, b) {
+  const na = normalizePath(a);
+  const nb = normalizePath(b);
+  return !!na && !!nb && na === nb;
+}
+
 export class SessionSidebar {
   constructor(container, onSessionSelect) {
     this.container = container;
     this.onSessionSelect = onSessionSelect;
     this.activeSessionFile = null;
+    /** Live Pi process cwd — only sessions under this path can live-switch */
+    this.liveCwd = null;
     this.projects = [];
     this.collapsedProjects = new Set();
     this.searchQuery = '';
@@ -18,6 +45,52 @@ export class SessionSidebar {
     document.addEventListener('contextmenu', (e) => {
       // Close if right-clicking outside a session item
       if (!e.target.closest('.session-item')) this.closeContextMenu();
+    });
+  }
+
+  /** Update live working directory; foreign projects become read-only in the UI */
+  setLiveCwd(cwd) {
+    const next = cwd || null;
+    const unchanged =
+      (!this.liveCwd && !next) || pathsEqual(this.liveCwd, next);
+    this.liveCwd = next;
+    if (unchanged) {
+      this.applyForeignCwdStyles();
+      return;
+    }
+    // Re-render so current-cwd projects float to the top and RO styles apply
+    if (this.projects.length) this.render();
+    else this.applyForeignCwdStyles();
+  }
+
+  isSameCwdProject(project) {
+    if (!this.liveCwd) return true; // unknown → don't lock out
+    if (!project?.path) return false;
+    return pathsEqual(project.path, this.liveCwd);
+  }
+
+  applyForeignCwdStyles() {
+    if (!this.container) return;
+    this.container.querySelectorAll('.project-group').forEach((group) => {
+      const path = group.dataset.projectPath || '';
+      const foreign = this.liveCwd && path && !pathsEqual(path, this.liveCwd);
+      group.classList.toggle('foreign-cwd', !!foreign);
+      group.querySelectorAll('.session-item').forEach((el) => {
+        el.classList.toggle('foreign-cwd', !!foreign);
+        el.title = foreign
+          ? 'Other directory — read-only history (live switch only for current cwd)'
+          : '';
+      });
+    });
+    // Favourites / search items carry data-project-path when available
+    this.container.querySelectorAll('.session-item[data-project-path]').forEach((el) => {
+      if (el.closest('.project-group')) return; // already handled
+      const path = el.dataset.projectPath || '';
+      const foreign = this.liveCwd && path && !pathsEqual(path, this.liveCwd);
+      el.classList.toggle('foreign-cwd', !!foreign);
+      el.title = foreign
+        ? 'Other directory — read-only history (live switch only for current cwd)'
+        : '';
     });
   }
 
@@ -114,19 +187,28 @@ export class SessionSidebar {
       const item = document.createElement('div');
       item.className = 'session-item search-result-item';
       item.dataset.filePath = result.filePath;
+      if (result.project) item.dataset.projectPath = result.project;
 
       if (result.filePath === this.activeSessionFile) {
         item.classList.add('active');
+      }
+
+      const foreign = this.liveCwd && result.project && !pathsEqual(result.project, this.liveCwd);
+      if (foreign) {
+        item.classList.add('foreign-cwd');
+        item.title = 'Other directory — read-only history';
       }
 
       const title = result.sessionName || result.firstMessage || 'Untitled';
       const snippet = result.matches[0]?.snippet || '';
       const matchCount = result.matches.length;
       const time = this.formatTime(result.sessionTimestamp);
+      const roTag = foreign ? '<span class="session-tag ro-tag">RO</span>' : '';
 
       item.innerHTML = `
         <div class="session-title-row">
           <div class="session-title" title="${this.escapeHtml(title)}">${this.escapeHtml(title)}</div>
+          ${roTag}
         </div>
         <div class="search-snippet">${this.highlightMatch(snippet, this.searchQuery)}</div>
         <div class="session-meta">${time}${matchCount > 1 ? ` · ${matchCount} matches` : ''}</div>
@@ -345,21 +427,30 @@ export class SessionSidebar {
     const item = document.createElement('div');
     item.className = 'session-item';
     item.dataset.filePath = session.filePath;
+    if (project?.path) item.dataset.projectPath = project.path;
 
     if (session.filePath === this.activeSessionFile) {
       item.classList.add('active');
+    }
+
+    const foreign = !this.isSameCwdProject(project);
+    if (foreign) {
+      item.classList.add('foreign-cwd');
+      item.title = 'Other directory — read-only history (live switch only for current cwd)';
     }
 
     const title = session.name || session.firstMessage || 'Empty session';
     const time = this.formatTime(session.timestamp);
     const tmuxTag = session.tmux ? '<span class="session-tag tmux-tag">tmux</span>' : '';
     const favIcon = this.isFavourite(session.filePath) ? '<span class="session-fav-icon">★</span>' : '';
+    const roTag = foreign ? '<span class="session-tag ro-tag" title="Read-only">RO</span>' : '';
 
     item.innerHTML = `
       <div class="session-title-row">
         ${favIcon}
         <div class="session-title" title="${this.escapeHtml(title)}">${this.escapeHtml(title)}</div>
         ${tmuxTag}
+        ${roTag}
       </div>
       <div class="session-meta">${time}</div>
     `;
@@ -406,21 +497,32 @@ export class SessionSidebar {
       this.container.appendChild(favGroup);
     }
 
-    // Regular project groups
-    for (const project of this.projects) {
+    // Regular project groups — current cwd first, then foreign (read-only)
+    const sortedProjects = [...this.projects].sort((a, b) => {
+      const aSame = this.isSameCwdProject(a) ? 0 : 1;
+      const bSame = this.isSameCwdProject(b) ? 0 : 1;
+      if (aSame !== bSame) return aSame - bSame;
+      return 0;
+    });
+
+    for (const project of sortedProjects) {
       const group = document.createElement('div');
-      group.className = 'project-group';
+      const foreign = !this.isSameCwdProject(project);
+      group.className = `project-group${foreign ? ' foreign-cwd' : ''}`;
+      if (project.path) group.dataset.projectPath = project.path;
       const isCollapsed = this.collapsedProjects.has(project.dirName);
 
       const header = document.createElement('div');
       header.className = `project-header${isCollapsed ? ' collapsed' : ''}`;
 
-      const pathParts = project.path.split('/').filter(Boolean);
+      const pathParts = project.path.replace(/\\/g, '/').split('/').filter(Boolean);
       const shortPath = pathParts.length > 0 ? pathParts[pathParts.length - 1] : project.path;
+      const roLabel = foreign ? '<span class="project-ro-label">read-only</span>' : '';
 
       header.innerHTML = `
         <span class="chevron">▼</span>
         <span title="${this.escapeHtml(project.path)}">${this.escapeHtml(shortPath)}</span>
+        ${roLabel}
         <span class="project-count">${project.sessions.length}</span>
       `;
 
@@ -448,6 +550,7 @@ export class SessionSidebar {
     }
 
     if (this.searchQuery) this.applySearch();
+    this.applyForeignCwdStyles();
   }
 
   formatTime(isoTimestamp) {

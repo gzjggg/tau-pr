@@ -730,6 +730,7 @@ export default function (pi: ExtensionAPI) {
       thinkingLevel,
       sessionName,
       sessionFile,
+      cwd: sessionCover?.cwd || (ctx as any)?.cwd || process.cwd(),
       isStreaming: !ctx.isIdle(),
       contextUsage,
       commands,
@@ -1299,8 +1300,19 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     }
 
     if (urlPath === "/api/health") {
+      const liveCwd =
+        (latestCtx as any)?.cwd ||
+        process.cwd();
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", mode: "mirror", mirrorUrl, tailscaleUrl: tailscaleUrl || undefined, platform: process.platform }));
+      res.end(JSON.stringify({
+        status: "ok",
+        mode: "mirror",
+        mirrorUrl,
+        tailscaleUrl: tailscaleUrl || undefined,
+        platform: process.platform,
+        cwd: liveCwd,
+        sessionFile: (latestCtx as any)?.sessionManager?.getSessionFile?.() || undefined,
+      }));
       return;
     }
 

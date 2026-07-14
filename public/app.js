@@ -7,7 +7,7 @@ import { StateManager } from './state.js';
 import { MessageRenderer } from './message-renderer.js';
 import { ToolCardRenderer } from './tool-card.js';
 import { DialogHandler } from './dialogs.js';
-import { SessionSidebar } from './session-sidebar.js';
+import { SessionSidebar, pathsEqual } from './session-sidebar.js';
 import { themes, applyTheme, getCurrentTheme } from './themes.js';
 import { FileBrowser, getFileIcon } from './file-browser.js';
 import { Launcher } from './launcher.js';
@@ -108,6 +108,7 @@ let hasNewWhileScrolled = false;
 let lastSentMessage = null; // Track to avoid duplicate rendering in mirror mode
 let lastUsage = null; // Full usage object for context visualiser
 let mirrorActiveSessionFile = null; // The live session file path from the TUI
+let mirrorActiveCwd = null; // Live Pi process cwd — live switch only within this directory
 let viewingActiveSession = true; // Whether we're viewing the live session or a historical one
 let isMirrorMode = false; // Set when mirror_sync received
 let liveInstances = []; // All running Tau instances [{port, sessionFile, cwd}]
@@ -148,6 +149,10 @@ fetch('/api/health').then(r => r.json()).then(data => {
   const names = { win32: 'Explorer', darwin: 'Finder', linux: 'file manager' };
   const name = names[data.platform] || 'file manager';
   document.getElementById('file-sidebar-finder').title = `Open in ${name}`;
+  if (data?.cwd && !mirrorActiveCwd) {
+    mirrorActiveCwd = data.cwd;
+    sidebar.setLiveCwd(mirrorActiveCwd);
+  }
 }).catch(() => {});
 
 document.getElementById('file-sidebar-finder').addEventListener('click', () => {
@@ -1370,10 +1375,27 @@ async function handleSessionSelect(session, project) {
  * Strategy (mirror / same Pi process):
  * 1. Another live Tau instance already owns that session → reconnect WS to that port
  * 2. Same instance active session → re-sync
- * 3. Otherwise → ask Pi to switchSession(absolute path) so TUI + Web both move
- *    (unlike TUI /resume picker, this accepts any session file under ~/.pi/agent/sessions)
- * 4. If Pi switch fails → fall back to read-only history browse
+ * 3. Same cwd as live Pi → ask Pi switchSession (avoids TUI "cwd not found" confirm)
+ * 4. Other directories → always read-only history (never live-switch)
+ * 5. If same-cwd live switch fails → fall back to read-only history browse
  */
+function sessionBelongsToLiveCwd(project, sessionFile) {
+  // Prefer project.path from sidebar grouping
+  if (project?.path && mirrorActiveCwd) {
+    return pathsEqual(project.path, mirrorActiveCwd);
+  }
+  // If we don't know live cwd yet, allow live switch attempt only when project path missing
+  if (!mirrorActiveCwd) return true;
+  return false;
+}
+
+async function openSessionReadOnly(session, project, notice) {
+  viewingActiveSession = false;
+  updateMirrorInputState();
+  await loadSessionHistory(session, project);
+  if (notice) messageRenderer.renderSystemMessage(notice);
+}
+
 async function switchSession(sessionFile, session = null, project = null) {
   try {
     // Clear any streaming state from previous session to prevent bleed
@@ -1408,7 +1430,7 @@ async function switchSession(sessionFile, session = null, project = null) {
       return;
     }
 
-    // In mirror mode, prefer live Pi switch over read-only browse
+    // In mirror mode, prefer live Pi switch only for same-cwd sessions
     if (isMirrorMode) {
       const otherInstance = liveInstances.find(
         (i) => i.sessionFile === sessionFile && i.port !== Number(new URL(wsClient.url).port)
@@ -1421,6 +1443,10 @@ async function switchSession(sessionFile, session = null, project = null) {
         wsClient.url = newUrl;
         wsClient.forceReconnect();
         mirrorActiveSessionFile = sessionFile;
+        if (otherInstance.cwd) {
+          mirrorActiveCwd = otherInstance.cwd;
+          sidebar.setLiveCwd(mirrorActiveCwd);
+        }
         viewingActiveSession = true;
         updateMirrorInputState();
         return;
@@ -1433,11 +1459,20 @@ async function switchSession(sessionFile, session = null, project = null) {
         return;
       }
 
-      // Ask Pi to switch the live session (absolute path; works across project dirs)
+      // Different project directory → read-only only (Pi /resume would prompt on missing cwd)
+      if (!sessionBelongsToLiveCwd(project, sessionFile)) {
+        await openSessionReadOnly(
+          session,
+          project,
+          'Other directory session — read-only. Live switch is limited to the current working directory to avoid Pi cwd confirmation prompts.'
+        );
+        return;
+      }
+
+      // Same cwd: ask Pi to switch the live session
       messageRenderer.renderSystemMessage('Switching Pi session…');
       statusText.textContent = 'Switching session…';
       try {
-        // Prefer WebSocket so we share the same adapter path as execute_command
         const switched = await requestSessionSwitch(sessionFile);
         if (switched.ok) {
           mirrorActiveSessionFile = sessionFile;
@@ -1450,19 +1485,21 @@ async function switchSession(sessionFile, session = null, project = null) {
           return;
         }
         console.warn('[App] Live switch failed, opening read-only:', switched.error);
-        messageRenderer.renderSystemMessage(
+        await openSessionReadOnly(
+          session,
+          project,
           `Could not switch live Pi session (${switched.error || 'unknown'}). Showing history read-only. Tip: run /tau-switch once in the terminal to arm the hook, then retry.`
         );
+        return;
       } catch (e) {
         console.warn('[App] Live switch error, read-only fallback:', e);
-        messageRenderer.renderSystemMessage('Could not switch live Pi session. Showing history read-only.');
+        await openSessionReadOnly(
+          session,
+          project,
+          'Could not switch live Pi session. Showing history read-only.'
+        );
+        return;
       }
-
-      // Read-only fallback: load history without moving Pi
-      viewingActiveSession = false;
-      updateMirrorInputState();
-      await loadSessionHistory(session, project);
-      return;
     }
 
     // Non-mirror path
@@ -1532,8 +1569,17 @@ function handleMirrorSync(data) {
   isMirrorMode = true;
   resetScrollState();
 
-  // Track the active session
+  // Track the active session + live cwd (session cover / snapshot)
   mirrorActiveSessionFile = data.sessionFile || null;
+  const cwdFromSync =
+    data.sessionCover?.cwd ||
+    data.cwd ||
+    liveInstances.find((i) => i.sessionFile === data.sessionFile)?.cwd ||
+    null;
+  if (cwdFromSync) {
+    mirrorActiveCwd = cwdFromSync;
+    sidebar.setLiveCwd(mirrorActiveCwd);
+  }
   viewingActiveSession = true;
   updateMirrorInputState();
   updateMirrorLiveIndicator();
@@ -1610,6 +1656,19 @@ async function pollInstances() {
       const data = await res.json();
       liveInstances = data.instances || [];
       updateMirrorLiveIndicator();
+      // Keep live cwd in sync from the instance that owns this port / active session
+      const selfPort = Number(location.port) || (location.protocol === 'https:' ? 443 : 80);
+      const self =
+        liveInstances.find((i) => i.sessionFile === mirrorActiveSessionFile) ||
+        liveInstances.find((i) => Number(i.port) === selfPort) ||
+        liveInstances[0];
+      if (self?.cwd && !pathsEqual(self.cwd, mirrorActiveCwd)) {
+        mirrorActiveCwd = self.cwd;
+        sidebar.setLiveCwd(mirrorActiveCwd);
+      } else if (self?.cwd && !mirrorActiveCwd) {
+        mirrorActiveCwd = self.cwd;
+        sidebar.setLiveCwd(mirrorActiveCwd);
+      }
     }
   } catch {}
 }
@@ -1633,6 +1692,8 @@ function updateMirrorInputState() {
     inputArea?.classList.add('mirror-readonly');
   }
 }
+
+
 
 // ═══════════════════════════════════════
 // Session history rendering

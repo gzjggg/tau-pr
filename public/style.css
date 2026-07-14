@@ -678,6 +678,73 @@ body {
 
 .session-item.hidden { display: none; }
 
+/* Other-directory sessions: grey, compact, read-only visual */
+.project-group.foreign-cwd {
+  opacity: 0.72;
+  margin-top: 6px;
+}
+
+.project-group.foreign-cwd .project-header {
+  font-size: 11px;
+  padding: 4px 10px;
+  color: var(--text-dim);
+}
+
+.project-group.foreign-cwd .project-header:hover {
+  color: var(--text-secondary);
+}
+
+.project-ro-label {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  opacity: 0.85;
+  margin-left: 2px;
+}
+
+.session-item.foreign-cwd {
+  padding: 4px 10px;
+  opacity: 0.78;
+  border-radius: var(--radius-sm);
+  margin: 0 4px;
+}
+
+.session-item.foreign-cwd:hover {
+  background: var(--bg-glass);
+  opacity: 0.95;
+}
+
+.session-item.foreign-cwd .session-title {
+  font-size: 12px;
+  font-weight: 450;
+  color: var(--text-dim);
+}
+
+.session-item.foreign-cwd .session-meta {
+  font-size: 10px;
+  opacity: 0.8;
+}
+
+.session-item.foreign-cwd.active {
+  background: var(--bg-glass);
+  box-shadow: inset 2px 0 0 var(--text-dim);
+}
+
+.session-item.foreign-cwd.active .session-title {
+  color: var(--text-secondary);
+}
+
+.session-tag.ro-tag {
+  font-size: 8px;
+  padding: 0 4px;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  background: var(--bg-glass);
+  letter-spacing: 0.03em;
+}
+
 .session-title-row {
   display: flex;
   align-items: center;
@@ -2067,16 +2134,23 @@ body {
 
 /* ═══════════════════════════════════════════════════════
    Code Blocks — glass panel with frosted header
+   Shrink-wrap to content (cap at container width)
    ═══════════════════════════════════════════════════════ */
 
 .code-block-wrapper {
   position: relative;
+  display: inline-block;
+  width: fit-content;
+  max-width: 100%;
+  min-width: 0;
   margin: 8px 0;
   border-radius: var(--radius);
   overflow: hidden;
   border: 1px solid var(--border);
   background: rgba(0, 0, 0, 0.25);
   backdrop-filter: blur(12px);
+  vertical-align: top;
+  box-sizing: border-box;
 }
 
 :root[data-theme="clean"] .code-block-wrapper,
@@ -2089,12 +2163,21 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 6px 12px;
+  gap: 12px;
+  padding: 4px 10px;
   background: var(--bg-glass);
   border-bottom: 1px solid var(--border);
   font-size: 11px;
   color: var(--text-dim);
   font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+  min-width: 0;
+}
+
+.code-block-header > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .copy-btn {
@@ -2107,6 +2190,7 @@ body {
   border-radius: var(--radius-sm);
   transition: all var(--duration) var(--ease);
   font-family: inherit;
+  flex-shrink: 0;
 }
 
 .copy-btn:hover { background: var(--bg-glass-hover); color: var(--text-secondary); }
@@ -2114,18 +2198,24 @@ body {
 
 pre {
   background: transparent;
-  padding: 12px;
+  padding: 8px 12px;
   overflow-x: auto;
   font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
   font-size: 12px;
-  line-height: 1.6;
+  line-height: 1.55;
   margin: 0;
   border: none;
   border-radius: 0;
+  max-width: 100%;
+  white-space: pre;
 }
 
 .code-block-wrapper pre {
   border-radius: 0;
+  /* Single short lines: don't stretch to a full chat column */
+  width: max-content;
+  max-width: min(100%, 72ch);
+  box-sizing: border-box;
 }
 
 pre code {
@@ -2135,6 +2225,7 @@ pre code {
   font-size: inherit;
   color: var(--text-primary);
   border: none;
+  white-space: inherit;
 }
 
 code {
@@ -2174,7 +2265,9 @@ code {
   color: var(--text-secondary);
   overflow: hidden;
   align-self: flex-start;
-  width: 100%;
+  width: fit-content;
+  max-width: 100%;
+  min-width: min(100%, 200px);
   flex-shrink: 0;
   backdrop-filter: blur(12px);
   transition: border-color var(--duration) var(--ease), box-shadow var(--duration) var(--ease);
@@ -2244,7 +2337,9 @@ body.hide-thinking .thinking-block { display: none !important; }
   font-size: 13px;
   overflow: hidden;
   align-self: flex-start;
-  width: 100%;
+  width: fit-content;
+  max-width: 100%;
+  min-width: min(100%, 220px);
   flex-shrink: 0;
   backdrop-filter: blur(12px);
   transition: border-color var(--duration) var(--ease);
@@ -2254,7 +2349,8 @@ body.hide-thinking .thinking-block { display: none !important; }
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 8px 12px;
+  gap: 10px;
+  padding: 6px 10px;
   cursor: pointer;
   user-select: none;
   transition: background var(--duration) var(--ease);
@@ -3525,8 +3621,10 @@ body.hide-thinking .thinking-block { display: none !important; }
   }
 
 
-  .tool-card, .thinking-block { width: 100%; }
+  .tool-card, .thinking-block { width: fit-content; max-width: 100%; }
   .tool-args-preview { max-width: 140px; }
+  .code-block-wrapper { max-width: 100%; }
+  .code-block-wrapper pre { max-width: 100%; }
   .file-sidebar, #file-sidebar-toggle { display: none !important; }
 
   /* iOS-style session list */
