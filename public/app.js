@@ -1094,8 +1094,32 @@ function updateThinkingBtn() {
   thinkingBtn.classList.toggle('off', currentThinkingLevel === 'off');
 }
 let currentModelId = '';
+/** Provider of the active model — required when the same id exists under multiple providers */
+let currentModelProvider = '';
 let availableModels = [];
 let currentThinkingLevel = 'off';
+
+function isCurrentModel(m) {
+  if (!m || !currentModelId) return false;
+  if (m.id !== currentModelId) return false;
+  // When provider is known, both must match (deepseek-v4-flash on deepseek vs bailian)
+  if (currentModelProvider) {
+    return (m.provider || '') === currentModelProvider;
+  }
+  return true;
+}
+
+function findCurrentModel() {
+  if (!currentModelId) return null;
+  if (currentModelProvider) {
+    return availableModels.find(
+      (m) => m.id === currentModelId && (m.provider || '') === currentModelProvider
+    ) || null;
+  }
+  // Ambiguous id: prefer single match, else leave unset
+  const matches = availableModels.filter((m) => m.id === currentModelId);
+  return matches.length === 1 ? matches[0] : matches[0] || null;
+}
 
 async function fetchModelInfo() {
   try {
@@ -1111,9 +1135,10 @@ async function fetchModelInfo() {
     }
     if (stateData.success && stateData.data?.model) {
       currentModelId = stateData.data.model.id || '';
+      currentModelProvider = stateData.data.model.provider || '';
       updateModelLabel();
 
-      const model = availableModels.find(m => m.id === currentModelId);
+      const model = findCurrentModel();
       if (model?.contextWindow) {
         contextWindowSize = model.contextWindow;
         updateTokenUsage();
@@ -1129,8 +1154,16 @@ async function fetchModelInfo() {
 }
 
 function updateModelLabel() {
-  const shortName = currentModelId.replace(/^claude-/, '').replace(/-\d{8}$/, '');
-  modelDropdownLabel.textContent = shortName || 'model';
+  const shortName = (currentModelId || '').replace(/^claude-/, '').replace(/-\d{8}$/, '');
+  // Show provider when the same model id exists under more than one provider
+  const sameIdCount = availableModels.filter((m) => m.id === currentModelId).length;
+  if (currentModelProvider && sameIdCount > 1) {
+    modelDropdownLabel.textContent = shortName
+      ? `${shortName} · ${currentModelProvider}`
+      : currentModelProvider;
+  } else {
+    modelDropdownLabel.textContent = shortName || 'model';
+  }
 }
 
 function toggleModelDropdown() {
@@ -1160,25 +1193,43 @@ function openModelDropdown() {
   function renderItems(filter) {
     itemsContainer.innerHTML = '';
     const query = (filter || '').toLowerCase();
+    // Show provider when any id appears more than once
+    const idCounts = new Map();
+    availableModels.forEach((m) => {
+      idCounts.set(m.id, (idCounts.get(m.id) || 0) + 1);
+    });
+
     availableModels.forEach(m => {
       const shortName = m.id.replace(/-\d{8}$/, '');
       const providerStr = m.provider || '';
       if (query && !shortName.toLowerCase().includes(query) && !providerStr.toLowerCase().includes(query)) return;
 
       const el = document.createElement('div');
-      el.className = `model-dropdown-item${m.id === currentModelId ? ' active' : ''}`;
+      el.className = `model-dropdown-item${isCurrentModel(m) ? ' active' : ''}`;
+      el.dataset.modelId = m.id;
+      el.dataset.provider = providerStr;
       const ctxK = m.contextWindow ? `${(m.contextWindow / 1000).toFixed(0)}k` : '';
-      const providerLabel = m.provider && m.provider !== 'anthropic' ? `<span class="model-dropdown-item-provider">${m.provider}</span>` : '';
+      const showProvider = providerStr && (providerStr !== 'anthropic' || (idCounts.get(m.id) || 0) > 1);
+      const providerLabel = showProvider
+        ? `<span class="model-dropdown-item-provider">${providerStr}</span>`
+        : '';
       el.innerHTML = `<span>${shortName}${providerLabel}</span><span class="model-dropdown-item-ctx">${ctxK}</span>`;
       el.addEventListener('click', async () => {
         closeModelDropdown();
         const display = m.id.replace(/^claude-/, '').replace(/-\d{8}$/, '');
-        await rpcCommand({ type: 'set_model', provider: m.provider, modelId: m.id }, `Switching to ${display}...`);
-        currentModelId = m.id;
-        updateModelLabel();
-        if (m.contextWindow) {
-          contextWindowSize = m.contextWindow;
-          updateTokenUsage();
+        const label = providerStr ? `${display} (${providerStr})` : display;
+        const res = await rpcCommand(
+          { type: 'set_model', provider: m.provider, modelId: m.id },
+          `Switching to ${label}...`
+        );
+        if (res?.success !== false) {
+          currentModelId = m.id;
+          currentModelProvider = m.provider || '';
+          updateModelLabel();
+          if (m.contextWindow) {
+            contextWindowSize = m.contextWindow;
+            updateTokenUsage();
+          }
         }
       });
       itemsContainer.appendChild(el);
@@ -1775,9 +1826,10 @@ function handleMirrorSync(data) {
   if (mirrorActiveSessionFile) sidebar.setActive(mirrorActiveSessionFile);
   updateMirrorLiveIndicator();
 
-  // Update model display
+  // Update model display (provider + id — same id can exist on multiple providers)
   if (data.model) {
     currentModelId = data.model.id || '';
+    currentModelProvider = data.model.provider || '';
     updateModelLabel();
     if (data.model.contextWindow) {
       contextWindowSize = data.model.contextWindow;

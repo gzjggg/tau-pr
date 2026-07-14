@@ -13,7 +13,18 @@
  *
  * NEVER call process.exit from this file — browser close must not kill Pi.
  */
-const TAU_BUILD_ID = "tau-2026-07-14-polish-v9";
+const TAU_BUILD_ID = "tau-2026-07-14-quiet-model-v10";
+
+/** Routine logs only when TAU_DEBUG=1 (keeps TUI clean) */
+const TAU_DEBUG =
+  process.env.TAU_DEBUG === "1" || process.env.TAU_DEBUG === "true";
+function mlog(...args: any[]) {
+  if (TAU_DEBUG) console.log(...args);
+}
+function mwarn(...args: any[]) {
+  // Always show real failures; soft operational noise stays behind TAU_DEBUG
+  if (TAU_DEBUG) console.warn(...args);
+}
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { WebSocketServer, WebSocket } from "ws";
@@ -138,7 +149,6 @@ let latestCtx: ExtensionContext | null = null;
 let activePi: ExtensionAPI | null = null;
 let mirrorUrl = "";
 let tailscaleUrl = "";
-let processExitHookInstalled = false;
 let factoryInvokeCount = 0;
 
 /** Always use the current session's ExtensionAPI (never a closed-over stale pi). */
@@ -324,7 +334,7 @@ export default function (pi: ExtensionAPI) {
   factoryInvokeCount++;
   // Critical: keep a live API pointer for HTTP/WS handlers started by the first factory
   activePi = pi;
-  console.log(
+  mlog(
     `[Mirror] factory invoke #${factoryInvokeCount} (shared clients=${clients.size}, server=${server ? "up" : "down"})`
   );
 
@@ -348,7 +358,7 @@ export default function (pi: ExtensionAPI) {
       refreshSessionCapture(ctx as any, pi as any);
       pi.getCommands?.();
     } catch { /* ignore */ }
-    console.log("[Mirror] Resume hooks warmed (no closed-over ctx)");
+    mlog("[Mirror] Resume hooks warmed");
   }
 
   // Args: absolute path to session .jsonl. No args = warm hooks only.
@@ -376,14 +386,14 @@ export default function (pi: ExtensionAPI) {
         });
         // Do NOT touch `ctx` after resume — it is stale. Use latestCtx / console only.
         if (result.cancelled) {
-          console.warn("[Tau] /tau-switch cancelled");
+          mwarn("[Tau] /tau-switch cancelled");
           return;
         }
         if (!result.ok) {
-          console.warn("[Tau] /tau-switch failed:", result.error);
+          mwarn("[Tau] /tau-switch failed:", result.error);
           return;
         }
-        console.log("[Tau] /tau-switch ok", result.newSessionFile || target);
+        mlog("[Tau] /tau-switch ok", result.newSessionFile || target);
       } catch (e: any) {
         console.warn("[Tau] /tau-switch error:", e);
       }
@@ -419,7 +429,7 @@ export default function (pi: ExtensionAPI) {
     try {
       piCommands = await commandAdapter.list();
     } catch (e) {
-      console.warn("[Mirror] Command discovery failed:", (e as Error).message);
+      mwarn("[Mirror] Command discovery failed:", (e as Error).message);
     }
     // Merge: Tau actions first, then Pi (dedupe by invocation)
     const seen = new Set<string>();
@@ -575,7 +585,7 @@ export default function (pi: ExtensionAPI) {
           return v;
         });
       } catch (e2) {
-        console.warn("[Mirror] broadcast JSON failed:", e2);
+        mwarn("[Mirror] broadcast JSON failed:", e2);
         return null;
       }
     }
@@ -591,7 +601,7 @@ export default function (pi: ExtensionAPI) {
           client.send(json);
           sent++;
         } catch (e) {
-          console.warn("[Mirror] client.send failed:", e);
+          mwarn("[Mirror] client.send failed:", e);
         }
       }
     }
@@ -678,7 +688,7 @@ export default function (pi: ExtensionAPI) {
       stopServer();
       ctx.ui.setStatus("mirror", "");
       ctx.ui.notify("Tau mirror server stopped", "info");
-      console.log("[Mirror] Server stopped via /taustop");
+      mlog("[Mirror] Server stopped via /taustop");
     },
   });
 
@@ -758,7 +768,7 @@ export default function (pi: ExtensionAPI) {
         const payload = eventPayloadForBrowser(eventType, event);
         broadcast({ type: "event", event: payload });
       } catch (e) {
-        console.warn(`[Mirror] broadcast ${eventType} failed:`, e);
+        mwarn(`[Mirror] broadcast ${eventType} failed:`, e);
       }
     });
   }
@@ -814,7 +824,7 @@ export default function (pi: ExtensionAPI) {
         broadcast({ type: "event", event: { type: "session_name", name: title } });
       }
     } catch (e) {
-      console.warn("[Mirror] auto-title skipped:", e);
+      mwarn("[Mirror] auto-title skipped:", e);
     }
   });
 
@@ -1036,7 +1046,7 @@ export default function (pi: ExtensionAPI) {
                   broadcast(snapshot);
                 }
               } catch (e) {
-                console.warn("[Mirror] post-new snapshot:", e);
+                mwarn("[Mirror] post-new snapshot:", e);
               }
               sendTo(ws, success("new_session", {
                 sessionFile: result.newSessionFile || latestCtx?.sessionManager?.getSessionFile?.(),
@@ -1162,7 +1172,7 @@ export default function (pi: ExtensionAPI) {
 
         case "shutdown": {
           // Intentionally never process.exit — only acknowledge
-          console.log("[Mirror] WS shutdown received — ignored (Pi stays alive)");
+          mlog("[Mirror] WS shutdown received — ignored");
           sendTo(ws, success("shutdown", {
             ignored: true,
             exitProcess: false,
@@ -1342,7 +1352,7 @@ export default function (pi: ExtensionAPI) {
             sendTo(ws, success("cycle_thinking_level", { level: actual }));
           } catch (e: any) {
             const msg = e?.message || String(e);
-            console.warn("[Mirror] cycle_thinking_level failed:", msg);
+            mwarn("[Mirror] cycle_thinking_level failed:", msg);
             sendTo(ws, error("cycle_thinking_level", msg));
           }
           break;
@@ -1809,7 +1819,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
               if (parsed?.reason) reason = String(parsed.reason);
             }
           } catch { /* ignore */ }
-          console.log(`[Mirror] /api/shutdown ignored (reason=${reason}, build=${TAU_BUILD_ID}) — Pi stays alive`);
+          mlog(`[Mirror] /api/shutdown ignored (reason=${reason})`);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({
             ok: true,
@@ -1852,7 +1862,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
               broadcast(snapshot);
             }
           } catch (e) {
-            console.warn("[Mirror] post-new snapshot:", e);
+            mwarn("[Mirror] post-new snapshot:", e);
           }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({
@@ -1949,14 +1959,14 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
           if (!result.ok && liveNow) {
             try {
               if (path.resolve(liveNow).toLowerCase() === path.resolve(sessionFile).toLowerCase()) {
-                console.log("[Mirror] Resume reported fail but live session matches — success");
+                mlog("[Mirror] Resume soft-success (live session matches)");
                 result = { ...result, ok: true, recovered: true };
               }
             } catch { /* ignore */ }
           }
           // Also soft-success if TUI moved off preFile (switch happened)
           if (!result.ok && liveNow && preFile && path.resolve(liveNow).toLowerCase() !== path.resolve(preFile).toLowerCase()) {
-            console.log("[Mirror] Live session file changed — treating resume as success");
+            mlog("[Mirror] Resume soft-success (live session file changed)");
             result = { ...result, ok: true, recovered: true };
           }
 
@@ -1996,11 +2006,11 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
                 const snapshot = await buildStateSnapshot(latestCtx);
                 broadcast(snapshot);
               } catch (e) {
-                console.warn("[Mirror] post-resume snapshot skipped (ctx may still rebind):", e);
+                mwarn("[Mirror] post-resume snapshot skipped:", e);
               }
             }
           } catch (e) {
-            console.warn("[Mirror] post-resume update skipped:", e);
+            mwarn("[Mirror] post-resume update skipped:", e);
           }
 
           let outFile = sessionFile;
@@ -2520,7 +2530,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     });
 
     wss.on("connection", (ws) => {
-      console.log("[Mirror] Browser client connected");
+      mlog("[Mirror] Browser client connected");
       clients.add(ws);
       (ws as any).isAlive = true;
 
@@ -2548,7 +2558,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       });
 
       ws.on("close", () => {
-        console.log("[Mirror] Browser client disconnected");
+        mlog("[Mirror] Browser client disconnected");
         clients.delete(ws);
       });
 
@@ -2587,7 +2597,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
           const instances = getRunningInstances();
           const stale = instances.find(i => i.port === port && i.pid !== process.pid);
           if (stale && isZombieProcess(stale.pid)) {
-            console.log(`[Mirror] Port ${port} in use by stale Tau instance (PID ${stale.pid}), killing...`);
+            mlog(`[Mirror] Port ${port} in use by stale Tau instance (PID ${stale.pid}), killing...`);
             try { process.kill(stale.pid, "SIGTERM"); } catch {}
             // Wait briefly then retry the same port
             setTimeout(() => {
@@ -2596,7 +2606,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
             }, 500);
             return;
           }
-          console.log(`[Mirror] Port ${port} in use, trying ${port + 1}...`);
+          mlog(`[Mirror] Port ${port} in use, trying ${port + 1}...`);
           server!.removeAllListeners("error");
           tryListen(port + 1, maxAttempts);
         } else {
@@ -2654,21 +2664,27 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
 
       mirrorUrl = `http://${localIp}:${port}`;
       tailscaleUrl = tailscaleIp ? `http://${tailscaleIp}:${port}` : "";
-      console.log(`[Mirror] Tau mirror server running on ${mirrorUrl}${tailscaleUrl ? `  •  Tailscale: ${tailscaleUrl}` : ""}`);
-      ctx.ui.setStatus("mirror", `Mirror: ${localIp}:${port}${tailscaleIp ? ` • TS: ${tailscaleIp}:${port}` : ""}`);
+      // Compact status for TUI (avoid multi-line spam)
+      console.log(`[Mirror] ${mirrorUrl}${tailscaleUrl ? ` · TS ${tailscaleUrl}` : ""}`);
+      try {
+        ctx.ui.setStatus("mirror", `τ:${port}`);
+      } catch { /* ignore */ }
 
       // Register this instance
       const sessionFile = ctx.sessionManager.getSessionFile() || "";
       registerInstance(port, sessionFile, ctx.cwd || process.cwd());
 
-      ctx.ui.notify(`Tau mirror: ${mirrorUrl}${tailscaleUrl ? `  •  Tailscale: ${tailscaleUrl}` : ""}  •  /qr for QR code`, "info");
+      // One short notify — not a wall of text
+      try {
+        ctx.ui.notify(`Tau ${mirrorUrl}`, "info");
+      } catch { /* ignore */ }
 
       // Auto-open browser once — delayed so leftover-tab beacons cannot race startup
       if (TAU_AUTO_OPEN && !browserOpenedOnce) {
         browserOpenedOnce = true;
         const localUrl = `http://127.0.0.1:${port}`;
         setTimeout(() => {
-          console.log(`[Mirror] Auto-opening browser: ${localUrl}`);
+          mlog(`[Mirror] Auto-opening browser: ${localUrl}`);
           openInBrowser(localUrl);
         }, 2000);
       }
@@ -2706,7 +2722,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     // (pi-subagents sets PI_SUBAGENT_CHILD=1; child processes loading Tau
     // should not attempt to start their own mirror server)
     if (process.env.PI_SUBAGENT_CHILD === "1") {
-      console.log("[Mirror] Subagent child process detected (PI_SUBAGENT_CHILD=1), skipping auto-start.");
+      mlog("[Mirror] Subagent child — skip auto-start");
       return;
     }
 
@@ -2717,18 +2733,18 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     // Do NOT restart the HTTP/WS stack; that drops browser clients mid-switch.
     if (server) {
       updateInstanceSession(sessionFile, cwd);
-      console.log(`[Mirror] Session start (server already running) → ${sessionFile || "(no file)"}`);
+      mlog(`[Mirror] Session start (server up) → ${sessionFile || "(no file)"}`);
       try {
         const snapshot = await buildStateSnapshot(ctx);
         broadcast(snapshot);
       } catch (e) {
-        console.warn("[Mirror] Failed to broadcast post-switch snapshot:", e);
+        mwarn("[Mirror] Failed to broadcast post-switch snapshot:", e);
       }
       return;
     }
 
     if (!TAU_AUTO_START) {
-      console.log("[Mirror] Tau auto-start disabled (TAU_DISABLED=1). Use /tau-start to start manually.");
+      mlog("[Mirror] Auto-start disabled (TAU_DISABLED=1)");
       return;
     }
 
@@ -2739,19 +2755,11 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   // Cleanup — NEVER process.exit from Tau
   // ═══════════════════════════════════════
   pi.on("session_shutdown", async () => {
-    // Keep mirror server alive across TUI /resume (session_shutdown fires on switch).
-    console.log("[Mirror] Session ended (mirror server kept alive)");
+    mlog("[Mirror] Session ended (mirror kept alive)");
   });
 
-  // Do NOT intercept process.exit permanently — that breaks Pi /quit.
-  // Browser close already cannot kill Pi (/api/shutdown is a no-op for exit).
+  // Quiet startup: one line only (set TAU_DEBUG=1 for verbose)
   if (factoryInvokeCount === 1) {
-    let extPath = "unknown";
-    try {
-      extPath = typeof __filename !== "undefined" ? __filename : "esm";
-    } catch { /* ignore */ }
-    console.log(`[Mirror] === TAU BUILD ${TAU_BUILD_ID} loaded ===`);
-    console.log(`[Mirror] extension file: ${extPath}`);
-    console.log(`[Mirror] shared clients + activePi — streaming & thinking survive session switch`);
+    console.log(`[Mirror] Tau ${TAU_BUILD_ID} · :${PORT}${TAU_DEBUG ? " · debug" : ""}`);
   }
 }

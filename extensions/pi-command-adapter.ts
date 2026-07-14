@@ -178,12 +178,13 @@ function tryPatchInternals(): void {
                   const liveSwitch = actions.switchSession.bind(actions);
                   capturedSwitchSession = (sessionPath: string, options?: any) =>
                     liveSwitch(sessionPath, options);
-                  console.log("[Tau] Captured interactive switchSession (handleResumeSession)");
+                  if (process.env.TAU_DEBUG === "1" || process.env.TAU_DEBUG === "true") {
+                    console.log("[Tau] Captured interactive switchSession");
+                  }
                 }
                 if (actions?.newSession) {
                   const liveNew = actions.newSession.bind(actions);
                   capturedNewSession = (options?: any) => liveNew(options);
-                  console.log("[Tau] Captured interactive newSession");
                 }
                 return result;
               };
@@ -734,7 +735,9 @@ export async function resumeSessionLikeTui(
     if (result && (result as any).cancelled) {
       return { ok: false, cancelled: true, error: "Session resume cancelled", sessionCwd };
     }
-    console.log("[Tau] resume (like /resume pick) ok →", resolved);
+    if (process.env.TAU_DEBUG === "1" || process.env.TAU_DEBUG === "true") {
+      console.log("[Tau] resume ok →", resolved);
+    }
     return { ok: true, sessionCwd, newSessionFile };
   } catch (e) {
     const lastError = e instanceof Error ? e.message : String(e);
@@ -743,7 +746,9 @@ export async function resumeSessionLikeTui(
     // Switch often already completed; Pi then invalidates the pre-switch ctx.
     // Treat classic "stale after session replacement" as soft success.
     if (/stale after session replacement|stale after session|ctx is stale/i.test(lastError)) {
-      console.log("[Tau] stale-ctx after switch — treating as success (TUI already resumed)");
+      if (process.env.TAU_DEBUG === "1" || process.env.TAU_DEBUG === "true") {
+        console.log("[Tau] stale-ctx after switch — treating as success");
+      }
       return {
         ok: true,
         recovered: true,
@@ -816,7 +821,9 @@ export async function newSessionLikeTui(options?: {
     if (result && (result as any).cancelled) {
       return { ok: false, cancelled: true, error: "New session cancelled" };
     }
-    console.log("[Tau] newSession ok →", newSessionFile || "(in-memory?)");
+    if (process.env.TAU_DEBUG === "1" || process.env.TAU_DEBUG === "true") {
+      console.log("[Tau] newSession ok →", newSessionFile || "(in-memory?)");
+    }
     return { ok: true, newSessionFile };
   } catch (e) {
     const lastError = e instanceof Error ? e.message : String(e);
