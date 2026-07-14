@@ -13,7 +13,7 @@
  *
  * NEVER call process.exit from this file — browser close must not kill Pi.
  */
-const TAU_BUILD_ID = "tau-2026-07-14-fix-singleton-v7";
+const TAU_BUILD_ID = "tau-2026-07-14-fix-activePi-v8";
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { WebSocketServer, WebSocket } from "ws";
@@ -134,10 +134,20 @@ let wss: WebSocketServer | null = null;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 const clients = new Set<WebSocket>();
 let latestCtx: ExtensionContext | null = null;
+/** Live ExtensionAPI — updated on every factory invoke (session create/switch) */
+let activePi: ExtensionAPI | null = null;
 let mirrorUrl = "";
 let tailscaleUrl = "";
 let processExitHookInstalled = false;
 let factoryInvokeCount = 0;
+
+/** Always use the current session's ExtensionAPI (never a closed-over stale pi). */
+function getApi(): ExtensionAPI {
+  if (!activePi) {
+    throw new Error("Pi ExtensionAPI not ready");
+  }
+  return activePi;
+}
 
 function findPublicDir(): string {
     const candidates: string[] = [];
@@ -312,6 +322,8 @@ function sendAuthRequired(res: http.ServerResponse) {
 
 export default function (pi: ExtensionAPI) {
   factoryInvokeCount++;
+  // Critical: keep a live API pointer for HTTP/WS handlers started by the first factory
+  activePi = pi;
   console.log(
     `[Mirror] factory invoke #${factoryInvokeCount} (shared clients=${clients.size}, server=${server ? "up" : "down"})`
   );
@@ -888,6 +900,21 @@ export default function (pi: ExtensionAPI) {
   async function handleCommand(ws: WebSocket, command: any) {
     const id = command.id;
     const ctx = latestCtx;
+    // Always use the live ExtensionAPI (module-level activePi), never the factory
+    // parameter closed over by the first startServer invocation.
+    let piApi: ExtensionAPI;
+    try {
+      piApi = getApi();
+    } catch {
+      sendTo(ws, {
+        type: "response",
+        command: command.type,
+        success: false,
+        error: "Pi API not ready",
+        id,
+      });
+      return;
+    }
 
     const success = (cmd: string, data?: any) => {
       const resp: any = { type: "response", command: cmd, success: true, id };
@@ -905,7 +932,7 @@ export default function (pi: ExtensionAPI) {
         // Never call latestCtx.isIdle() without guard — after switchSession the ctx
         // is stale and throws, which previously swallowed prompts (GUI showed, TUI silent).
         case "prompt": {
-          refreshSessionCapture(undefined, pi as any);
+          refreshSessionCapture(undefined, piApi as any);
           let payload: string | any[] = command.message || "";
           if (command.images?.length) {
             const validMimes = ["image/png", "image/jpeg", "image/gif", "image/webp"];
@@ -925,7 +952,7 @@ export default function (pi: ExtensionAPI) {
             }
             if (content.some((c: any) => c.type === "image")) payload = content;
           }
-          const sent = sendPromptToLiveSession(pi as any, payload, {
+          const sent = sendPromptToLiveSession(piApi as any, payload, {
             streamingBehavior: command.streamingBehavior || undefined,
           });
           if (sent.ok) sendTo(ws, success("prompt"));
@@ -934,8 +961,8 @@ export default function (pi: ExtensionAPI) {
         }
 
         case "steer": {
-          refreshSessionCapture(undefined, pi as any);
-          const sent = sendPromptToLiveSession(pi as any, command.message, {
+          refreshSessionCapture(undefined, piApi as any);
+          const sent = sendPromptToLiveSession(piApi as any, command.message, {
             streamingBehavior: "steer",
           });
           if (sent.ok) sendTo(ws, success("steer"));
@@ -944,8 +971,8 @@ export default function (pi: ExtensionAPI) {
         }
 
         case "follow_up": {
-          refreshSessionCapture(undefined, pi as any);
-          const sent = sendPromptToLiveSession(pi as any, command.message, {
+          refreshSessionCapture(undefined, piApi as any);
+          const sent = sendPromptToLiveSession(piApi as any, command.message, {
             streamingBehavior: "followUp",
           });
           if (sent.ok) sendTo(ws, success("follow_up"));
@@ -958,7 +985,7 @@ export default function (pi: ExtensionAPI) {
             if (latestCtx) latestCtx.abort();
           } catch {
             try {
-              (pi as any).abort?.();
+              (piApi as any).abort?.();
             } catch { /* ignore */ }
           }
           sendTo(ws, success("abort"));
@@ -966,7 +993,7 @@ export default function (pi: ExtensionAPI) {
         }
 
         case "new_session": {
-          refreshSessionCapture(undefined, pi as any);
+          refreshSessionCapture(undefined, piApi as any);
           try {
             const result = await newSessionLikeTui({
               onNewSession: (newCtx) => {
@@ -1179,16 +1206,22 @@ export default function (pi: ExtensionAPI) {
             sendTo(ws, error("get_state", "No context available"));
             break;
           }
-          const model = ctx.model;
-          const state = {
-            model,
-            thinkingLevel: pi.getThinkingLevel(),
-            isStreaming: !ctx.isIdle(),
-            sessionFile: ctx.sessionManager.getSessionFile(),
-            sessionName: pi.getSessionName(),
-            autoCompactionEnabled: true, // Extension can't easily check this
-          };
-          sendTo(ws, success("get_state", state));
+          try {
+            const model = ctx.model;
+            let isStreaming = false;
+            try { isStreaming = !ctx.isIdle(); } catch { isStreaming = false; }
+            const state = {
+              model,
+              thinkingLevel: piApi.getThinkingLevel(),
+              isStreaming,
+              sessionFile: ctx.sessionManager.getSessionFile(),
+              sessionName: piApi.getSessionName(),
+              autoCompactionEnabled: true,
+            };
+            sendTo(ws, success("get_state", state));
+          } catch (e: any) {
+            sendTo(ws, error("get_state", e?.message || String(e)));
+          }
           break;
         }
 
@@ -1218,63 +1251,82 @@ export default function (pi: ExtensionAPI) {
             sendTo(ws, error("set_model", "No context available"));
             break;
           }
-          const models = await ctx.modelRegistry.getAvailable();
-          const model = models.find(
-            (m: any) => m.provider === command.provider && m.id === command.modelId
-          );
-          if (!model) {
-            sendTo(ws, error("set_model", `Model not found: ${command.provider}/${command.modelId}`));
-            break;
+          try {
+            const models = await ctx.modelRegistry.getAvailable();
+            const model = models.find(
+              (m: any) => m.provider === command.provider && m.id === command.modelId
+            );
+            if (!model) {
+              sendTo(ws, error("set_model", `Model not found: ${command.provider}/${command.modelId}`));
+              break;
+            }
+            const ok = await piApi.setModel(model);
+            if (!ok) {
+              sendTo(ws, error("set_model", "No API key for this model"));
+              break;
+            }
+            sendTo(ws, success("set_model", model));
+          } catch (e: any) {
+            sendTo(ws, error("set_model", e?.message || String(e)));
           }
-          const ok = await pi.setModel(model);
-          if (!ok) {
-            sendTo(ws, error("set_model", "No API key for this model"));
-            break;
-          }
-          sendTo(ws, success("set_model", model));
           break;
         }
 
         case "cycle_model": {
-          // Extension API doesn't have cycleModel directly
-          // Workaround: get available models, find current, pick next
           if (!ctx) {
             sendTo(ws, success("cycle_model", null));
             break;
           }
-          const availModels = await ctx.modelRegistry.getAvailable();
-          const currentModel = ctx.model;
-          if (!currentModel || availModels.length <= 1) {
-            sendTo(ws, success("cycle_model", null));
-            break;
+          try {
+            const availModels = await ctx.modelRegistry.getAvailable();
+            const currentModel = ctx.model;
+            if (!currentModel || availModels.length <= 1) {
+              sendTo(ws, success("cycle_model", null));
+              break;
+            }
+            const idx = availModels.findIndex(
+              (m: any) => m.provider === currentModel.provider && m.id === currentModel.id
+            );
+            const nextModel = availModels[(idx + 1) % availModels.length];
+            await piApi.setModel(nextModel);
+            sendTo(ws, success("cycle_model", {
+              model: nextModel,
+              thinkingLevel: piApi.getThinkingLevel(),
+            }));
+          } catch (e: any) {
+            sendTo(ws, error("cycle_model", e?.message || String(e)));
           }
-          const idx = availModels.findIndex(
-            (m: any) => m.provider === currentModel.provider && m.id === currentModel.id
-          );
-          const nextModel = availModels[(idx + 1) % availModels.length];
-          await pi.setModel(nextModel);
-          sendTo(ws, success("cycle_model", {
-            model: nextModel,
-            thinkingLevel: pi.getThinkingLevel(),
-          }));
           break;
         }
 
         // ─── Thinking ───
         case "cycle_thinking_level": {
-          const levels = ["off", "minimal", "low", "medium", "high"];
-          const current = pi.getThinkingLevel();
-          const idx = levels.indexOf(current);
-          const next = levels[(idx + 1) % levels.length];
-          pi.setThinkingLevel(next as any);
-          const actual = pi.getThinkingLevel();
-          sendTo(ws, success("cycle_thinking_level", { level: actual }));
+          try {
+            const levels = ["off", "minimal", "low", "medium", "high"];
+            const current = piApi.getThinkingLevel();
+            const idx = levels.indexOf(current as string);
+            const next = levels[(idx + 1) % levels.length];
+            piApi.setThinkingLevel(next as any);
+            const actual = piApi.getThinkingLevel();
+            sendTo(ws, success("cycle_thinking_level", { level: actual }));
+          } catch (e: any) {
+            sendTo(ws, error(
+              "cycle_thinking_level",
+              e?.message || String(e)
+            ));
+          }
           break;
         }
 
         case "set_thinking_level": {
-          pi.setThinkingLevel(command.level);
-          sendTo(ws, success("set_thinking_level"));
+          try {
+            piApi.setThinkingLevel(command.level);
+            sendTo(ws, success("set_thinking_level", {
+              level: piApi.getThinkingLevel(),
+            }));
+          } catch (e: any) {
+            sendTo(ws, error("set_thinking_level", e?.message || String(e)));
+          }
           break;
         }
 
@@ -1311,8 +1363,12 @@ export default function (pi: ExtensionAPI) {
             sendTo(ws, error("set_session_name", "Name cannot be empty"));
             break;
           }
-          pi.setSessionName(name);
-          sendTo(ws, success("set_session_name"));
+          try {
+            piApi.setSessionName(name);
+            sendTo(ws, success("set_session_name"));
+          } catch (e: any) {
+            sendTo(ws, error("set_session_name", e?.message || String(e)));
+          }
           break;
         }
 
