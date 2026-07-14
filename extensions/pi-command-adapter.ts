@@ -616,6 +616,8 @@ export async function switchPiSession(sessionFile: string): Promise<{ ok: boolea
     };
   }
 
+  // Only try handlers until one succeeds. Do NOT chain multiple switchSession
+  // calls — a partial success + second attempt can desync TUI vs HTTP response.
   let lastError = "unknown";
   for (const attempt of attempts) {
     try {
@@ -628,6 +630,12 @@ export async function switchPiSession(sessionFile: string): Promise<{ ok: boolea
     } catch (e) {
       lastError = e instanceof Error ? e.message : String(e);
       console.warn("[Tau] switchSession attempt failed:", lastError);
+      // If the error looks like "already switched" / path, treat as soft success
+      if (/already|same session|no.?op|not modified/i.test(lastError)) {
+        return { ok: true };
+      }
+      // One failure → stop (do not call switchSession again)
+      break;
     }
   }
 

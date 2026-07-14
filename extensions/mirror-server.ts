@@ -938,9 +938,18 @@ export default function (pi: ExtensionAPI) {
         }
 
         case "shutdown": {
-          // Browser tab/window closed → stop mirror + exit Pi
-          sendTo(ws, success("shutdown", { shuttingDown: true }));
-          setTimeout(() => quitPiProcess(command.reason || "ws_shutdown"), 100);
+          // Default: stop mirror only. exitProcess:true required to kill Pi.
+          const exitProcess = command.exitProcess === true || command.exit === true;
+          sendTo(ws, success("shutdown", { stoppingServer: true, exitProcess }));
+          setTimeout(() => {
+            if (exitProcess) quitPiProcess(command.reason || "ws_shutdown");
+            else {
+              try {
+                stopServer();
+                console.log("[Mirror] Server stopped via WS shutdown (Pi kept alive)");
+              } catch { /* ignore */ }
+            }
+          }, 100);
           break;
         }
 
@@ -1477,24 +1486,40 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return;
     }
 
-    // Shutdown Tau + exit Pi process (triggered when Web UI tab/window closes)
+    // Shutdown Tau mirror (optional: also exit Pi). Default is server-only so
+    // browser lifecycle events (pagehide during session switch) never kill TUI.
     if (urlPath === "/api/shutdown" && (req.method === "POST" || req.method === "GET")) {
       let body = "";
       req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
       req.on("end", () => {
         let reason = "web_ui_closed";
+        let exitProcess = false;
         try {
           if (body) {
             const parsed = JSON.parse(body);
             if (parsed?.reason) reason = String(parsed.reason);
+            // Explicit opt-in only — never exit Pi from bare beacon/pagehide
+            if (parsed?.exitProcess === true || parsed?.exit === true) exitProcess = true;
           }
         } catch { /* ignore */ }
 
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, shuttingDown: true, reason }));
+        res.end(JSON.stringify({ ok: true, stoppingServer: true, exitProcess, reason }));
 
-        // Delay so the HTTP response can flush
-        setTimeout(() => quitPiProcess(reason), 150);
+        setTimeout(() => {
+          if (exitProcess) {
+            quitPiProcess(reason);
+          } else {
+            try {
+              stopServer();
+              console.log(`[Mirror] Server stopped (reason: ${reason}, Pi process kept alive)`);
+              try { latestCtx?.ui?.setStatus?.("mirror", ""); } catch { /* ignore */ }
+              try { latestCtx?.ui?.notify?.("Tau Web closed — mirror stopped (Pi still running)", "info"); } catch { /* ignore */ }
+            } catch (e) {
+              console.warn("[Mirror] stopServer on shutdown failed:", e);
+            }
+          }
+        }, 150);
       });
       return;
     }
@@ -1548,26 +1573,72 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
 
           let result = await switchPiSession(sessionFile);
 
-          // If hooks not ready, ask user path via registered command once more after delay
+          // If hooks not ready, retry once after a short delay (single retry only)
           if (!result.ok && /unavailable|hooks not ready|no-op/i.test(result.error || "")) {
             await new Promise((r) => setTimeout(r, 400));
             try { pi.getCommands?.(); } catch { /* ignore */ }
             result = await switchPiSession(sessionFile);
           }
 
-          if (!result.ok) {
-            res.writeHead(result.cancelled ? 409 : 500, { "Content-Type": "application/json" });
+          // Give session_start a moment to rebind latestCtx after a successful switch
+          if (result.ok) {
+            await new Promise((r) => setTimeout(r, 150));
+            invalidateCommands("session_switch");
+            gitCache = null;
+            try {
+              if (latestCtx) {
+                const liveFile =
+                  latestCtx.sessionManager?.getSessionFile?.() || sessionFile;
+                updateInstanceSession(
+                  liveFile,
+                  (latestCtx as any).cwd || process.cwd()
+                );
+                const snapshot = await buildStateSnapshot(latestCtx);
+                broadcast(snapshot);
+              }
+            } catch (e) {
+              console.warn("[Mirror] post-switch snapshot failed:", e);
+            }
+
+            const liveFile =
+              latestCtx?.sessionManager?.getSessionFile?.() || sessionFile;
+            res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({
-              error: result.error || "Switch failed",
-              cancelled: result.cancelled,
-              hint: "In the Pi terminal run: /tau-switch   (arms the hook), then retry the sidebar click.",
+              success: true,
+              mirror: true,
+              switched: true,
+              sessionFile: liveFile,
+              cwd: (latestCtx as any)?.cwd || process.cwd(),
             }));
             return;
           }
-          invalidateCommands("session_switch");
-          gitCache = null;
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: true, mirror: true, switched: true, sessionFile }));
+
+          // Soft recovery: if TUI already moved to the requested file, treat as success
+          const currentFile = latestCtx?.sessionManager?.getSessionFile?.() || "";
+          const resolvedReq = path.resolve(sessionFile);
+          const resolvedCur = currentFile ? path.resolve(currentFile) : "";
+          if (resolvedCur && resolvedCur.toLowerCase() === resolvedReq.toLowerCase()) {
+            try {
+              const snapshot = await buildStateSnapshot(latestCtx!);
+              broadcast(snapshot);
+            } catch { /* ignore */ }
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              success: true,
+              mirror: true,
+              switched: true,
+              sessionFile: currentFile,
+              recovered: true,
+            }));
+            return;
+          }
+
+          res.writeHead(result.cancelled ? 409 : 500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            error: result.error || "Switch failed",
+            cancelled: result.cancelled,
+            hint: "In the Pi terminal run: /tau-switch   (arms the hook), then retry the sidebar click.",
+          }));
         } catch (e: any) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: e?.message || String(e) }));
