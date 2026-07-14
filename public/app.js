@@ -1405,6 +1405,46 @@ async function openSessionReadOnly(session, project, notice) {
   if (notice) messageRenderer.renderSystemMessage(notice);
 }
 
+/** True if the chat pane has real user/assistant/tool content (not just system/welcome). */
+function hasChatContent() {
+  if (!messagesEl) return false;
+  if (messagesEl.querySelector('.tool-card, .thinking-block')) return true;
+  const msgs = messagesEl.querySelectorAll('.message');
+  for (const m of msgs) {
+    if (m.classList.contains('user') || m.classList.contains('assistant')) return true;
+  }
+  return false;
+}
+
+/**
+ * Always paint session transcript from disk first (never blank after sidebar click),
+ * then optionally follow live mirror_sync.
+ */
+async function paintSessionFromDisk(session, project) {
+  state.reset();
+  messageRenderer.clear();
+  toolCardRenderer.clear();
+  resetScrollState();
+  await loadSessionHistory(session, project);
+}
+
+/** After resume/sync, request live snapshot; if still empty, re-paint from disk. */
+function scheduleLiveSyncAndFallback(session, project) {
+  setTimeout(() => {
+    try { wsClient.send({ type: 'mirror_sync_request' }); } catch { /* ignore */ }
+  }, 200);
+  setTimeout(() => {
+    try { wsClient.send({ type: 'mirror_sync_request' }); } catch { /* ignore */ }
+  }, 700);
+  setTimeout(async () => {
+    if (!hasChatContent() && session) {
+      console.warn('[App] Live sync still empty — re-painting from disk');
+      await loadSessionHistory(session, project);
+    }
+    updateMirrorInputState();
+  }, 1400);
+}
+
 /** Resume live session the same way as TUI /resume after picking a row */
 async function resumeLikeTui(sessionFile) {
   const res = await fetch('/api/sessions/resume', {
@@ -1441,17 +1481,23 @@ async function switchSession(sessionFile, session = null, project = null) {
     }
 
     if (isMirrorMode) {
-      // Already live → soft re-sync
+      // Already the live session → show disk transcript immediately, then re-sync
+      // (fixes blank UI after browsing a foreign-dir session and clicking back)
       if (sessionFilesEqual(sessionFile, mirrorActiveSessionFile)) {
         viewingActiveSession = true;
         updateMirrorInputState();
         statusText.textContent = 'Syncing…';
-        state.reset();
-        messageRenderer.clear();
-        toolCardRenderer.clear();
-        resetScrollState();
-        wsClient.send({ type: 'mirror_sync_request' });
-        setTimeout(() => { statusText.textContent = 'Connected'; }, 800);
+        sidebar.setActive(sessionFile);
+        if (session) {
+          await paintSessionFromDisk(session, project);
+        } else {
+          state.reset();
+          messageRenderer.clear();
+          toolCardRenderer.clear();
+          resetScrollState();
+        }
+        scheduleLiveSyncAndFallback(session, project);
+        setTimeout(() => { statusText.textContent = 'Connected'; }, 900);
         return;
       }
 
@@ -1472,6 +1518,7 @@ async function switchSession(sessionFile, session = null, project = null) {
         }
         viewingActiveSession = true;
         updateMirrorInputState();
+        if (session) await paintSessionFromDisk(session, project);
         return;
       }
 
@@ -1481,12 +1528,16 @@ async function switchSession(sessionFile, session = null, project = null) {
       // Same working directory → resume like TUI /resume pick (path as arg)
       if (sameCwd) {
         statusText.textContent = 'Resuming…';
+        // Paint target transcript FIRST so UI is never blank after foreign-dir browse
+        if (session) {
+          await paintSessionFromDisk(session, project);
+        }
         messageRenderer.renderSystemMessage(
           `Resuming “${label}” (same as /resume in terminal)…`
         );
         try {
           const result = await resumeLikeTui(sessionFile);
-          if (result.ok) {
+          if (result.ok || /stale after session replacement|ctx is stale/i.test(result.error || '')) {
             mirrorActiveSessionFile = result.data?.sessionFile || sessionFile;
             if (result.data?.cwd) {
               mirrorActiveCwd = result.data.cwd;
@@ -1495,62 +1546,28 @@ async function switchSession(sessionFile, session = null, project = null) {
             viewingActiveSession = true;
             updateMirrorInputState();
             sidebar.setActive(mirrorActiveSessionFile);
-            statusText.textContent = result.data?.recovered
-              ? 'Session resumed (recovered)'
+            statusText.textContent = result.data?.recovered || result.error
+              ? 'Session resumed'
               : 'Session resumed';
             setTimeout(() => { statusText.textContent = 'Connected'; }, 1500);
-            // Live snapshot from session_start; request again as safety net
-            setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 200);
-            setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 700);
-            setTimeout(async () => {
-              const empty = !messagesEl.querySelector(
-                '.message, .tool-card, .thinking-block, .session-cover'
-              );
-              if (empty) {
-                console.warn('[App] mirror_sync empty after resume — loading history from disk');
-                await loadSessionHistory(session, project);
-                viewingActiveSession = true;
-                updateMirrorInputState();
-              }
-            }, 1200);
+            // Keep disk paint; overlay live snapshot when ready
+            scheduleLiveSyncAndFallback(session, project);
             return;
           }
 
-          // Stale-ctx errors often mean TUI already switched — treat as live + sync
-          if (/stale after session replacement|ctx is stale/i.test(result.error || '')) {
-            console.warn('[App] Resume reported stale-ctx — assuming TUI switched, syncing GUI');
-            mirrorActiveSessionFile = sessionFile;
-            viewingActiveSession = true;
-            updateMirrorInputState();
-            sidebar.setActive(sessionFile);
-            statusText.textContent = 'Syncing after resume…';
-            setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 200);
-            setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 800);
-            setTimeout(async () => {
-              const empty = !messagesEl.querySelector(
-                '.message, .tool-card, .thinking-block, .session-cover'
-              );
-              if (empty) await loadSessionHistory(session, project);
-              viewingActiveSession = true;
-              updateMirrorInputState();
-              statusText.textContent = 'Connected';
-            }, 1400);
-            return;
-          }
-
-          // Fall back to history if resume refused
+          // Fall back to history (already painted) — stay read-only
           console.warn('[App] Resume-like failed:', result.error);
-          await openSessionReadOnly(
-            session,
-            project,
-            `Could not resume “${label}”: ${result.error || 'unknown'}. Showing history. Tip: in Pi run /tau-switch once, then retry — or use /resume in the terminal.`
+          viewingActiveSession = false;
+          updateMirrorInputState();
+          messageRenderer.renderSystemMessage(
+            `Could not resume “${label}”: ${result.error || 'unknown'}. Showing history. Tip: run /tau-switch once in Pi, or use /resume.`
           );
           return;
         } catch (e) {
           console.warn('[App] Resume error:', e);
-          await openSessionReadOnly(
-            session,
-            project,
+          viewingActiveSession = false;
+          updateMirrorInputState();
+          messageRenderer.renderSystemMessage(
             `Resume failed for “${label}”. Showing history read-only.`
           );
           return;
@@ -1701,13 +1718,29 @@ function handleMirrorSync(data) {
   }
 
   // Clear and render message history (prologue slot is outside #messages)
-  messageRenderer.clear();
   sessionTotalCost = 0;
   lastInputTokens = 0;
 
   if (data.entries && data.entries.length > 0) {
+    messageRenderer.clear();
+    toolCardRenderer.clear();
     renderSessionHistory(data.entries);
+  } else if (data.sessionFile) {
+    // Snapshot arrived empty (common right after resume). Do NOT wipe a disk paint
+    // with welcome — fill from session file so returning from foreign-dir browse works.
+    const already = hasChatContent();
+    if (!already) {
+      messageRenderer.clear();
+      toolCardRenderer.clear();
+      loadSessionHistory({ filePath: data.sessionFile }, null).then(() => {
+        updateMirrorInputState();
+      });
+    } else {
+      console.log('[Mirror] Empty snapshot ignored — keeping already-painted history');
+    }
   } else {
+    messageRenderer.clear();
+    toolCardRenderer.clear();
     messageRenderer.renderWelcome();
     scrollToBottom({ force: true });
   }
