@@ -2133,28 +2133,56 @@ body {
 }
 
 /* ═══════════════════════════════════════════════════════
-   Shared rail for tool / thinking / code — same width, right gap
+   Shared rail for tool / thinking / code — FIXED same width
+   min-width prevents thinking from collapsing to label width
+   when nested inside content-sized .message bubbles.
    ═══════════════════════════════════════════════════════ */
 
 :root {
-  --msg-rail-max: 40rem;   /* ~640px: unified bubble width */
-  --msg-rail-gap: 4.5rem;  /* right breathing room — never flush to edge */
+  --msg-rail-max: 36rem;   /* unified bubble width */
+  --msg-rail-gap: 5rem;    /* right breathing room */
+}
+
+/* Force identical rail for all three — never shrink-to-fit */
+.messages .tool-card,
+.messages .thinking-block,
+.messages .code-block-wrapper,
+.message .thinking-block,
+.message .code-block-wrapper {
+  display: block !important;
+  box-sizing: border-box !important;
+  width: min(var(--msg-rail-max), calc(100% - var(--msg-rail-gap))) !important;
+  max-width: min(var(--msg-rail-max), calc(100% - var(--msg-rail-gap))) !important;
+  /* Critical: min-width = width so empty/collapsed thinking keeps full rail */
+  min-width: min(12rem, 100%) !important;
+  margin-right: var(--msg-rail-gap) !important;
+  margin-left: 0 !important;
+  align-self: flex-start !important;
+  flex-shrink: 0 !important;
+}
+
+/* Assistant messages that only wrap thinking should not shrink the rail */
+.message.assistant {
+  max-width: min(85%, calc(var(--msg-rail-max) + var(--msg-rail-gap) + 2rem));
+  width: auto;
+  min-width: min(var(--msg-rail-max), 50%);
+}
+
+.message.assistant .message-content {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
 .code-block-wrapper {
   position: relative;
-  display: block;
-  width: min(var(--msg-rail-max), calc(100% - var(--msg-rail-gap)));
-  max-width: calc(100% - var(--msg-rail-gap));
-  min-width: 0;
-  margin: 8px var(--msg-rail-gap) 8px 0;
+  margin-top: 8px;
+  margin-bottom: 8px;
   border-radius: var(--radius);
   overflow: hidden;
   border: 1px solid var(--border);
   background: rgba(0, 0, 0, 0.25);
   backdrop-filter: blur(12px);
-  box-sizing: border-box;
-  align-self: flex-start;
 }
 
 :root[data-theme="clean"] .code-block-wrapper,
@@ -2263,19 +2291,20 @@ code {
   background: var(--thinking-bg);
   border: 1px solid var(--border);
   padding: 0;
-  margin: 2px var(--msg-rail-gap) 2px 0;
+  margin-top: 2px;
+  margin-bottom: 2px;
   border-radius: var(--radius);
   font-size: 13px;
   color: var(--text-secondary);
   overflow: hidden;
-  align-self: flex-start;
-  width: min(var(--msg-rail-max), calc(100% - var(--msg-rail-gap)));
-  max-width: calc(100% - var(--msg-rail-gap));
-  min-width: 0;
-  flex-shrink: 0;
-  box-sizing: border-box;
   backdrop-filter: blur(12px);
   transition: border-color var(--duration) var(--ease), box-shadow var(--duration) var(--ease);
+}
+
+/* Fill the rail even when collapsed — toggle spans full width */
+.thinking-block .thinking-toggle {
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .thinking-block:hover {
@@ -2338,15 +2367,10 @@ body.hide-thinking .thinking-block { display: none !important; }
   background: var(--tool-bg);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  margin: 2px var(--msg-rail-gap) 2px 0;
+  margin-top: 2px;
+  margin-bottom: 2px;
   font-size: 13px;
   overflow: hidden;
-  align-self: flex-start;
-  width: min(var(--msg-rail-max), calc(100% - var(--msg-rail-gap)));
-  max-width: calc(100% - var(--msg-rail-gap));
-  min-width: 0;
-  flex-shrink: 0;
-  box-sizing: border-box;
   backdrop-filter: blur(12px);
   transition: border-color var(--duration) var(--ease);
 }
@@ -3629,10 +3653,14 @@ body.hide-thinking .thinking-block { display: none !important; }
   }
 
 
-  .tool-card, .thinking-block, .code-block-wrapper {
-    width: min(var(--msg-rail-max), calc(100% - 1.5rem));
-    max-width: calc(100% - 1.5rem);
-    margin-right: 1.5rem;
+  .messages .tool-card,
+  .messages .thinking-block,
+  .messages .code-block-wrapper,
+  .message .thinking-block {
+    width: calc(100% - 1.25rem) !important;
+    max-width: calc(100% - 1.25rem) !important;
+    min-width: 0 !important;
+    margin-right: 1.25rem !important;
   }
   .tool-args-preview { max-width: none; }
   .file-sidebar, #file-sidebar-toggle { display: none !important; }

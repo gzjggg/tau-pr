@@ -1497,9 +1497,20 @@ async function switchSession(sessionFile, session = null, project = null) {
             sidebar.setActive(mirrorActiveSessionFile);
             statusText.textContent = 'Session resumed';
             setTimeout(() => { statusText.textContent = 'Connected'; }, 1500);
-            // Snapshot is broadcast by server; request again as safety net
-            setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 300);
-            setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 900);
+            // Prefer live snapshot; if UI stays empty, paint history from disk
+            setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 200);
+            setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 700);
+            setTimeout(async () => {
+              const empty = !messagesEl.querySelector(
+                '.message, .tool-card, .thinking-block, .session-cover'
+              );
+              if (empty) {
+                console.warn('[App] mirror_sync empty after resume — loading history from disk');
+                await loadSessionHistory(session, project);
+                viewingActiveSession = true;
+                updateMirrorInputState();
+              }
+            }, 1200);
             return;
           }
           // Fall back to history if resume refused (hook not ready, etc.)
@@ -1542,33 +1553,63 @@ async function loadSessionHistory(session, project) {
     messageRenderer.renderWelcome();
     return;
   }
-  // Prefer explicit dirName; fall back to parent folder of filePath
+
+  // 1) Preferred: absolute path (reliable on Windows / encoded session dirs)
+  const absPath = session.filePath;
+  if (absPath) {
+    try {
+      const res = await fetch(
+        `/api/sessions/by-path?path=${encodeURIComponent(absPath)}`
+      );
+      if (res.ok) {
+        const data = await res.json();
+        messageRenderer.clear();
+        toolCardRenderer.clear();
+        renderSessionHistory(data.entries || []);
+        return;
+      }
+      const err = await res.json().catch(() => ({}));
+      console.warn('[App] by-path history failed:', res.status, err);
+      // fall through to dir/file route
+    } catch (e) {
+      console.warn('[App] by-path history error:', e);
+    }
+  }
+
+  // 2) Fallback: /api/sessions/:dirName/:file
   let dirName = project?.dirName;
   let file = session.file;
-  if ((!dirName || !file) && session.filePath) {
-    const parts = session.filePath.replace(/\\/g, '/').split('/');
+  if ((!dirName || !file) && absPath) {
+    const parts = absPath.replace(/\\/g, '/').split('/');
     file = file || parts.pop();
-    // Pi sessions live in ~/.pi/agent/sessions/<dirName>/<file>
-    // dirName is the last path segment of the parent folder
     if (!dirName && parts.length) dirName = parts[parts.length - 1];
   }
   if (!dirName || !file) {
-    messageRenderer.renderSystemMessage('Session path incomplete — cannot load history.');
+    messageRenderer.renderSystemMessage(
+      `Session path incomplete — cannot load history.${absPath ? ` path=${absPath}` : ''}`
+    );
     return;
   }
   try {
-    const res = await fetch(`/api/sessions/${encodeURIComponent(dirName)}/${encodeURIComponent(file)}`);
+    const res = await fetch(
+      `/api/sessions/${encodeURIComponent(dirName)}/${encodeURIComponent(file)}`
+    );
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      messageRenderer.renderError(err.error || `Failed to load history (${res.status})`);
+      messageRenderer.renderError(
+        err.error || `Failed to load history (${res.status}) dir=${dirName} file=${file}`
+      );
       return;
     }
     const data = await res.json();
     messageRenderer.clear();
+    toolCardRenderer.clear();
     renderSessionHistory(data.entries || []);
   } catch (e) {
     console.error('[App] History fetch error:', e);
-    messageRenderer.renderError('Failed to load session history');
+    messageRenderer.renderError(
+      `Failed to load session history: ${e?.message || e}`
+    );
   }
 }
 

@@ -1490,8 +1490,38 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return;
     }
 
+    // Session history by absolute file path (preferred — avoids dirName encoding issues)
+    // GET /api/sessions/by-path?path=C:\Users\...\.pi\agent\sessions\...\file.jsonl
+    const bareForSessions = (urlPath.split("?")[0] || "");
+    if (bareForSessions === "/api/sessions/by-path" && req.method === "GET") {
+      try {
+        const u = new URL(req.url || "/", "http://127.0.0.1");
+        let filePath = u.searchParams.get("path") || "";
+        try { filePath = decodeURIComponent(filePath); } catch { /* keep */ }
+        if (!filePath) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "path required" }));
+          return;
+        }
+        const resolved = path.resolve(filePath);
+        const sessionsRoot = path.resolve(SESSIONS_DIR);
+        // Must live under sessions dir (prevent path traversal)
+        const rel = path.relative(sessionsRoot, resolved);
+        if (rel.startsWith("..") || path.isAbsolute(rel)) {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Path outside sessions directory" }));
+          return;
+        }
+        serveSessionFileAbsolute(res, resolved);
+      } catch (e: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e?.message || String(e) }));
+      }
+      return;
+    }
+
     // Session file endpoint: /api/sessions/:dirName/:file
-    const sessionMatch = (urlPath.split("?")[0] || "").match(/^\/api\/sessions\/([^/]+)\/([^/]+)$/);
+    const sessionMatch = bareForSessions.match(/^\/api\/sessions\/([^/]+)\/([^/]+)$/);
     if (sessionMatch && req.method === "GET") {
       let dirName = sessionMatch[1];
       let file = sessionMatch[2];
@@ -1562,10 +1592,22 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
           refreshSessionCapture(latestCtx || undefined, pi as any);
           try { pi.getCommands?.(); } catch { /* ignore */ }
 
-          const result = await resumeSessionLikeTui(sessionFile, {
+          let result = await resumeSessionLikeTui(sessionFile, {
             requireSameCwd: true,
             liveCwd: (latestCtx as any)?.cwd || process.cwd(),
           });
+
+          // Soft success: if live session already points at the target (resume partially worked)
+          await new Promise((r) => setTimeout(r, 250));
+          const liveNow = latestCtx?.sessionManager?.getSessionFile?.() || "";
+          if (!result.ok && liveNow) {
+            try {
+              if (path.resolve(liveNow).toLowerCase() === path.resolve(sessionFile).toLowerCase()) {
+                console.log("[Mirror] Resume reported fail but live session matches — treating as success");
+                result = { ok: true, sessionCwd: result.sessionCwd };
+              }
+            } catch { /* ignore */ }
+          }
 
           if (!result.ok) {
             res.writeHead(result.cancelled ? 409 : 400, { "Content-Type": "application/json" });
@@ -1581,7 +1623,6 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
           }
 
           // Let session_start rebind, then push snapshot
-          await new Promise((r) => setTimeout(r, 200));
           invalidateCommands("session_switch");
           gitCache = null;
           try {
@@ -1603,6 +1644,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
             cwd: (latestCtx as any)?.cwd || process.cwd(),
           }));
         } catch (e: any) {
+          console.error("[Mirror] /api/sessions/resume error:", e);
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: e?.message || String(e) }));
         }
@@ -1799,12 +1841,10 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   // ═══════════════════════════════════════
   // Session file endpoint
   // ═══════════════════════════════════════
-  function serveSessionFile(res: http.ServerResponse, dirName: string, file: string) {
-    const filePath = path.join(SESSIONS_DIR, dirName, file);
-
+  function serveSessionFileAbsolute(res: http.ServerResponse, filePath: string) {
     if (!fs.existsSync(filePath)) {
       res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Session not found" }));
+      res.end(JSON.stringify({ error: "Session not found", path: filePath }));
       return;
     }
 
@@ -1812,8 +1852,8 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     const stream = fs.createReadStream(filePath, { encoding: "utf8" });
     let buffer = "";
 
-    stream.on("data", (chunk: string) => {
-      buffer += chunk;
+    stream.on("data", (chunk: string | Buffer) => {
+      buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
       for (const line of lines) {
@@ -1828,13 +1868,19 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         try { entries.push(JSON.parse(buffer)); } catch { /* skip */ }
       }
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ entries }));
+      res.end(JSON.stringify({ entries, filePath, count: entries.length }));
     });
 
     stream.on("error", (e: Error) => {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: e.message }));
     });
+  }
+
+  function serveSessionFile(res: http.ServerResponse, dirName: string, file: string) {
+    // dirName may contain leading dashes like --C--Users-14868--
+    const filePath = path.join(SESSIONS_DIR, dirName, file);
+    serveSessionFileAbsolute(res, filePath);
   }
 
   // ═══════════════════════════════════════
