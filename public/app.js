@@ -1372,21 +1372,20 @@ async function handleSessionSelect(session, project) {
 /**
  * Sidebar session selection.
  *
- * Strategy (mirror / same Pi process):
- * 1. Another live Tau instance already owns that session → reconnect WS to that port
- * 2. Same instance active session → re-sync
- * 3. Same cwd as live Pi → ask Pi switchSession (avoids TUI "cwd not found" confirm)
- * 4. Other directories → always read-only history (never live-switch)
- * 5. If same-cwd live switch fails → fall back to read-only history browse
+ * IMPORTANT: Never call Pi switchSession from the browser.
+ * Programmatic switchSession loads extensions (memctx, hephaestus, …) in a
+ * non-TUI context and has been observed to tear down the entire Pi process.
+ *
+ * Strategy:
+ * 1. Clicking the *live* session → re-sync mirror snapshot
+ * 2. Any other session → read-only history browse (same or other cwd)
+ * 3. Live session changes only via the Pi TUI (/resume) — GUI follows automatically
  */
 function sessionBelongsToLiveCwd(project, sessionFile) {
-  // Already the live session
   if (sessionFile && sessionFile === mirrorActiveSessionFile) return true;
-  // Prefer project.path from sidebar grouping vs live Pi cwd
   if (project?.path && mirrorActiveCwd) {
     return pathsEqual(project.path, mirrorActiveCwd);
   }
-  // Unknown live cwd → never live-switch (avoids Pi cwd prompts / process churn)
   return false;
 }
 
@@ -1396,75 +1395,27 @@ function sessionFilesEqual(a, b) {
   return pathsEqual(a, b);
 }
 
-async function fetchLiveSessionInfo() {
-  try {
-    const res = await fetch('/api/health');
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
-  }
-}
-
-/** After a live switch attempt, force GUI to follow whatever Pi is actually on */
-async function resyncLiveSession(expectedSessionFile) {
-  // Prefer WS snapshot (live entries); retry a few times while session_start settles
-  for (let i = 0; i < 10; i++) {
-    try {
-      wsClient.send({ type: 'mirror_sync_request' });
-    } catch { /* ignore */ }
-
-    const info = await fetchLiveSessionInfo();
-    if (info?.sessionFile) {
-      const matches =
-        !expectedSessionFile || sessionFilesEqual(info.sessionFile, expectedSessionFile);
-      if (matches || i >= 3) {
-        // Even if health lags, keep requesting sync — session_start also broadcasts
-        mirrorActiveSessionFile = info.sessionFile;
-        if (info.cwd) {
-          mirrorActiveCwd = info.cwd;
-          sidebar.setLiveCwd(mirrorActiveCwd);
-        }
-        viewingActiveSession = true;
-        updateMirrorInputState();
-        sidebar.setActive(info.sessionFile);
-        updateMirrorLiveIndicator();
-        if (matches) {
-          statusText.textContent = 'Session switched';
-          setTimeout(() => { statusText.textContent = 'Connected'; }, 1500);
-          return true;
-        }
-      }
-    }
-    await new Promise((r) => setTimeout(r, 200));
-  }
-
-  // Final push — handleMirrorSync will paint when snapshot arrives
-  try { wsClient.send({ type: 'mirror_sync_request' }); } catch { /* ignore */ }
-  return false;
-}
-
 async function openSessionReadOnly(session, project, notice) {
   viewingActiveSession = false;
   updateMirrorInputState();
+  state.reset();
+  messageRenderer.clear();
+  toolCardRenderer.clear();
+  resetScrollState();
   await loadSessionHistory(session, project);
   if (notice) messageRenderer.renderSystemMessage(notice);
 }
 
 async function switchSession(sessionFile, session = null, project = null) {
-  // Prevent browser lifecycle from stopping the mirror during switch
-  suppressPiShutdown = true;
   try {
-    // Clear streaming state only — keep messages until we have replacement content
-    // so a failed/slow switch does not leave a blank chat.
     currentStreamingElement = null;
     currentStreamingThinking = '';
     currentStreamingText = '';
 
-    // New session (null)
+    // New session (null) — never invent one from the web UI in mirror mode
     if (!sessionFile) {
       if (isMirrorMode) {
-        messageRenderer.renderSystemMessage('Use the Pi terminal or + for a new session in mirror mode.');
+        messageRenderer.renderSystemMessage('Use the Pi terminal to start a new session in mirror mode.');
         viewingActiveSession = true;
         updateMirrorInputState();
         wsClient.send({ type: 'mirror_sync_request' });
@@ -1473,28 +1424,33 @@ async function switchSession(sessionFile, session = null, project = null) {
         messageRenderer.clear();
         toolCardRenderer.clear();
         messageRenderer.renderWelcome();
-        const res = await fetch('/api/sessions/switch', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionFile: null }),
-        });
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          messageRenderer.renderError(err.error || 'Failed to create session');
-        }
       }
       return;
     }
 
-    // In mirror mode, prefer live Pi switch only for same-cwd sessions
     if (isMirrorMode) {
+      // Already viewing the live session → soft re-sync only
+      if (sessionFilesEqual(sessionFile, mirrorActiveSessionFile)) {
+        viewingActiveSession = true;
+        updateMirrorInputState();
+        statusText.textContent = 'Syncing…';
+        state.reset();
+        messageRenderer.clear();
+        toolCardRenderer.clear();
+        resetScrollState();
+        wsClient.send({ type: 'mirror_sync_request' });
+        setTimeout(() => { statusText.textContent = 'Connected'; }, 800);
+        return;
+      }
+
+      // Another Tau instance already owns that session → reconnect only (no Pi switch)
       const otherInstance = liveInstances.find(
         (i) => i.sessionFile === sessionFile && i.port !== Number(new URL(wsClient.url).port)
       );
       if (otherInstance) {
         const protocol = document.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const newUrl = `${protocol}//${location.hostname}:${otherInstance.port}/ws`;
-        console.log(`[App] Switching to instance on port ${otherInstance.port}`);
+        console.log(`[App] Reconnecting to instance on port ${otherInstance.port}`);
         wsClient.disconnect();
         wsClient.url = newUrl;
         wsClient.forceReconnect();
@@ -1508,112 +1464,20 @@ async function switchSession(sessionFile, session = null, project = null) {
         return;
       }
 
-      if (sessionFilesEqual(sessionFile, mirrorActiveSessionFile)) {
-        viewingActiveSession = true;
-        updateMirrorInputState();
-        state.reset();
-        messageRenderer.clear();
-        toolCardRenderer.clear();
-        wsClient.send({ type: 'mirror_sync_request' });
-        return;
-      }
-
-      // Different project directory (or unknown cwd) → read-only only
-      if (!sessionBelongsToLiveCwd(project, sessionFile)) {
-        state.reset();
-        messageRenderer.clear();
-        toolCardRenderer.clear();
-        await openSessionReadOnly(
-          session,
-          project,
-          'Other directory session — read-only. Live switch is limited to the current working directory.'
-        );
-        return;
-      }
-
-      // Same cwd: ask Pi to switch the live session (server stays up across switch)
-      statusText.textContent = 'Switching session…';
-      messageRenderer.renderSystemMessage('Switching Pi session…');
-      try {
-        const switched = await requestSessionSwitch(sessionFile);
-
-        // Always re-sync from live Pi — TUI may have switched even if HTTP looked flaky
-        const liveOk = await resyncLiveSession(sessionFile);
-        if (switched.ok || liveOk) {
-          // handleMirrorSync paints from WS; if snapshot lagged, load file as interim
-          const info = await fetchLiveSessionInfo();
-          if (!info?.sessionFile || !sessionFilesEqual(info.sessionFile, sessionFile)) {
-            // Still switching — soft-load history while waiting for mirror_sync
-            state.reset();
-            messageRenderer.clear();
-            toolCardRenderer.clear();
-            await loadSessionHistory(session, project);
-            viewingActiveSession = true;
-            updateMirrorInputState();
-            setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 400);
-          }
-          // If live already matches, leave painting to handleMirrorSync (may have run)
-          // Ensure we are not stuck in empty state:
-          if (!messagesEl.querySelector('.message, .tool-card, .thinking-block, .session-cover, .welcome')) {
-            state.reset();
-            messageRenderer.clear();
-            toolCardRenderer.clear();
-            await loadSessionHistory(session, project);
-            viewingActiveSession = true;
-            updateMirrorInputState();
-            setTimeout(() => wsClient.send({ type: 'mirror_sync_request' }), 300);
-          }
-          return;
-        }
-
-        console.warn('[App] Live switch failed, opening read-only:', switched.error);
-        state.reset();
-        messageRenderer.clear();
-        toolCardRenderer.clear();
-        await openSessionReadOnly(
-          session,
-          project,
-          `Could not switch live Pi session (${switched.error || 'unknown'}). Showing history read-only. Tip: run /tau-switch once in the terminal to arm the hook, then retry.`
-        );
-        return;
-      } catch (e) {
-        console.warn('[App] Live switch error:', e);
-        // Recover if TUI already moved
-        const recovered = await resyncLiveSession(sessionFile);
-        if (recovered) return;
-        state.reset();
-        messageRenderer.clear();
-        toolCardRenderer.clear();
-        await openSessionReadOnly(
-          session,
-          project,
-          'Could not switch live Pi session. Showing history read-only.'
-        );
-        return;
-      }
-    }
-
-    // Non-mirror path
-    state.reset();
-    messageRenderer.clear();
-    toolCardRenderer.clear();
-    const res = await fetch('/api/sessions/switch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionFile }),
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      messageRenderer.renderError(`Failed to switch session: ${err.error || res.status}`);
+      // All historical sessions: read-only browse. Live switch only in TUI (/resume).
+      const sameCwd = sessionBelongsToLiveCwd(project, sessionFile);
+      const notice = sameCwd
+        ? 'History view (read-only). To make this the live session, run /resume in the Pi terminal — Tau will follow automatically.'
+        : 'Other directory — history only (read-only). Live Pi session stays in the current working directory.';
+      await openSessionReadOnly(session, project, notice);
       return;
     }
-    await loadSessionHistory(session, project);
+
+    // Non-mirror path (standalone): history only
+    await openSessionReadOnly(session, project, null);
   } catch (error) {
-    console.error('[App] Failed to switch session:', error);
-    messageRenderer.renderError('Failed to switch session');
-  } finally {
-    // Keep suppress long enough for session_start + late pagehide
-    setTimeout(() => { suppressPiShutdown = false; }, 8000);
+    console.error('[App] Failed to open session:', error);
+    messageRenderer.renderError('Failed to open session');
   }
 }
 
@@ -1649,24 +1513,6 @@ async function loadSessionHistory(session, project) {
   } catch (e) {
     console.error('[App] History fetch error:', e);
     messageRenderer.renderError('Failed to load session history');
-  }
-}
-
-/** Switch live Pi session via HTTP (primary) with clear error payload */
-async function requestSessionSwitch(sessionFile) {
-  try {
-    const res = await fetch('/api/sessions/switch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionFile }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok && data.success) {
-      return { ok: true };
-    }
-    return { ok: false, error: data.error || `HTTP ${res.status}` };
-  } catch (e) {
-    return { ok: false, error: e?.message || String(e) };
   }
 }
 
@@ -2460,52 +2306,8 @@ if (splash) {
   });
 }
 
-// ═══════════════════════════════════════
-// Close Web UI → stop Tau mirror only (never kill Pi from browser lifecycle)
-// Session switch / pagehide previously triggered process.exit and killed TUI.
-// ═══════════════════════════════════════
-let piShutdownSent = false;
-/** Set true while switching sessions so a WS blip cannot stop the mirror */
-let suppressPiShutdown = false;
+// NOTE: Do NOT auto-stop Tau or exit Pi on pagehide/beforeunload.
+// Those events fire spuriously during session ops and previously killed the TUI.
+// Use /taustop in the terminal (or close the Pi process) to tear down the mirror.
 
-function requestMirrorStop(reason = 'web_ui_closed') {
-  if (piShutdownSent || suppressPiShutdown) {
-    console.log('[Tau] Mirror stop suppressed:', reason, { piShutdownSent, suppressPiShutdown });
-    return;
-  }
-  piShutdownSent = true;
-  // exitProcess: false — keep Pi TUI running
-  const payload = JSON.stringify({ reason, exitProcess: false });
-
-  try {
-    if (navigator.sendBeacon) {
-      const blob = new Blob([payload], { type: 'application/json' });
-      if (navigator.sendBeacon('/api/shutdown', blob)) {
-        console.log('[Tau] Mirror-stop beacon sent:', reason);
-        return;
-      }
-    }
-  } catch { /* fall through */ }
-
-  try {
-    fetch('/api/shutdown', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: payload,
-      keepalive: true,
-    }).catch(() => {});
-  } catch { /* ignore */ }
-
-  try {
-    wsClient?.send?.({ type: 'shutdown', reason, exitProcess: false });
-  } catch { /* ignore */ }
-}
-
-// Only stop the mirror server on real tab close — never exit the Pi process.
-window.addEventListener('pagehide', (e) => {
-  if (e.persisted) return;
-  if (suppressPiShutdown) return;
-  requestMirrorStop('pagehide');
-});
-
-console.log('[Tau] initialized');
+console.log('[Tau] initialized (browse-only sessions; no auto-shutdown)');
