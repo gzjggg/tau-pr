@@ -2527,64 +2527,9 @@ if (splash) {
   });
 }
 
-// ═══════════════════════════════════════
-// Close browser tab → stop Tau port + exit Pi
-// - Suppress during resume/new
-// - Suppress first N seconds after page load (redirect / auto-open races)
-// - Server also has startup grace so OLD tabs cannot kill a fresh Pi
-// ═══════════════════════════════════════
-let browserExitSent = false;
+// Browser tab close no longer kills Pi by default (caused startup 秒退 via leftover tabs).
+// Server ignores exitProcess unless tau.exitOnBrowserClose=true in settings.json.
+// Optional: still notify server (no-op / ignored) — disabled to avoid noise.
 let suppressBrowserExit = false;
-const pageLoadedAt = Date.now();
-const CLIENT_EXIT_MIN_AGE_MS = 8_000;
-let hadSuccessfulWs = false;
 
-wsClient.addEventListener('connected', () => {
-  hadSuccessfulWs = true;
-});
-
-function requestBrowserCloseShutdown(reason = 'pagehide') {
-  const age = Date.now() - pageLoadedAt;
-  if (browserExitSent || suppressBrowserExit) {
-    console.log('[Tau] Exit suppressed:', reason, { browserExitSent, suppressBrowserExit });
-    return;
-  }
-  // Early pagehide from refresh/auto-open/old-tab must not kill Pi
-  if (age < CLIENT_EXIT_MIN_AGE_MS) {
-    console.log(`[Tau] Exit ignored — page too young (${age}ms < ${CLIENT_EXIT_MIN_AGE_MS}ms)`);
-    return;
-  }
-  if (!hadSuccessfulWs) {
-    console.log('[Tau] Exit ignored — never had a live WebSocket');
-    return;
-  }
-  browserExitSent = true;
-  const payload = JSON.stringify({ reason, exitProcess: true });
-  try {
-    if (navigator.sendBeacon) {
-      const blob = new Blob([payload], { type: 'application/json' });
-      if (navigator.sendBeacon('/api/shutdown?exit=1', blob)) {
-        console.log('[Tau] Exit beacon sent:', reason);
-        return;
-      }
-    }
-  } catch { /* fall through */ }
-  try {
-    fetch('/api/shutdown?exit=1', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: payload,
-      keepalive: true,
-    }).catch(() => {});
-  } catch { /* ignore */ }
-  try {
-    wsClient?.send?.({ type: 'shutdown', reason, exitProcess: true });
-  } catch { /* ignore */ }
-}
-
-window.addEventListener('pagehide', (e) => {
-  if (e.persisted) return; // bfcache — not a real close
-  requestBrowserCloseShutdown('pagehide');
-});
-
-console.log('[Tau] initialized (safe prompt/new-session; guarded tab-close exit)');
+console.log('[Tau] initialized (no browser→process.exit; use /taustop or close terminal)');

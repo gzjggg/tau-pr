@@ -39,6 +39,8 @@ function loadTauSettings(): {
   authEnabled?: boolean;
   projectsDir?: string;
   allowRemoteCommandExecution?: boolean;
+  /** If true, closing the last browser tab can process.exit Pi. Default false (prevents startup 秒退). */
+  exitOnBrowserClose?: boolean;
 } {
   let settings: any = {};
   try {
@@ -53,6 +55,13 @@ function loadTauSettings(): {
       : autoOpenEnv === "1" || autoOpenEnv === "true"
         ? true
         : settings.autoOpenBrowser !== false;
+  const exitEnv = process.env.TAU_EXIT_ON_BROWSER_CLOSE;
+  const exitOnBrowserClose =
+    exitEnv === "1" || exitEnv === "true"
+      ? true
+      : exitEnv === "0" || exitEnv === "false"
+        ? false
+        : settings.exitOnBrowserClose === true;
   return {
     // 38471 — uncommon port to avoid clashes with typical dev servers (3000/3001/5173…)
     port: parseInt(process.env.TAU_MIRROR_PORT || String(settings.port || "38471"), 10),
@@ -67,6 +76,7 @@ function loadTauSettings(): {
     authEnabled: settings.authEnabled,
     projectsDir: process.env.TAU_PROJECTS_DIR || settings.projectsDir,
     allowRemoteCommandExecution: settings.allowRemoteCommandExecution === true,
+    exitOnBrowserClose,
   };
 }
 
@@ -97,8 +107,9 @@ let authEnabled = AUTH_CONFIGURED && TAU_SETTINGS.authEnabled !== false;
 let browserOpenedOnce = false;
 /** ms since mirror server started listening — used to ignore accidental exit beacons */
 let serverStartedAt = 0;
-/** Ignore process.exit from browser for this long after listen (old tabs / auto-open race) */
-const EXIT_GRACE_MS = 25_000;
+/** Ignore any browser shutdown for this long after listen (old tabs / auto-open race) */
+const EXIT_GRACE_MS = 60_000;
+const TAU_EXIT_ON_BROWSER_CLOSE = TAU_SETTINGS.exitOnBrowserClose === true;
 // @ts-ignore — __dirname is provided by jiti at runtime
 const STATIC_DIR = process.env.TAU_STATIC_DIR || findPublicDir();
 
@@ -991,29 +1002,27 @@ export default function (pi: ExtensionAPI) {
         }
 
         case "shutdown": {
-          let exitProcess = command.exitProcess === true || command.exit === true;
+          const wantExit = command.exitProcess === true || command.exit === true;
           const uptime = serverStartedAt ? Date.now() - serverStartedAt : 0;
-          if (exitProcess && uptime < EXIT_GRACE_MS) {
-            console.log(`[Mirror] WS shutdown exit ignored during grace (${uptime}ms)`);
-            exitProcess = false;
+          const exitProcess =
+            wantExit && TAU_EXIT_ON_BROWSER_CLOSE && uptime >= EXIT_GRACE_MS;
+          if (wantExit && !TAU_EXIT_ON_BROWSER_CLOSE) {
+            console.log("[Mirror] WS exit ignored (tau.exitOnBrowserClose is false)");
           }
-          sendTo(ws, success("shutdown", { stoppingServer: true, exitProcess }));
-          setTimeout(() => {
-            if (exitProcess) {
+          sendTo(ws, success("shutdown", {
+            exitProcess,
+            exitOnBrowserClose: TAU_EXIT_ON_BROWSER_CLOSE,
+          }));
+          if (exitProcess) {
+            setTimeout(() => {
               const live = [...clients].filter((c) => c.readyState === WebSocket.OPEN).length;
-              // This client is closing; allow 0 or 1 (self still open until close completes)
               if (live > 1) {
                 console.log(`[Mirror] Other clients connected (${live}) — not exiting Pi`);
                 return;
               }
               quitPiProcess(command.reason || "ws_shutdown");
-            } else if (uptime >= EXIT_GRACE_MS) {
-              try {
-                stopServer();
-                console.log("[Mirror] Server stopped via WS (Pi kept alive)");
-              } catch { /* ignore */ }
-            }
-          }, 150);
+            }, 150);
+          }
           break;
         }
 
@@ -1603,67 +1612,67 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return;
     }
 
-    // Close browser tab → stop mirror (+ optional exit Pi).
-    // Guarded: startup grace + other live clients prevent "open then die" races.
+    // Browser tab close beacon. NEVER kill Pi unless tau.exitOnBrowserClose is explicitly true.
+    // Default: ignore completely during grace; after grace only stopServer if no clients left.
     if (urlPath === "/api/shutdown" || barePath === "/api/shutdown") {
       if (req.method === "POST" || req.method === "GET") {
         let body = "";
         req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
         req.on("end", () => {
           let reason = "web_ui_closed";
-          let exitProcess = false;
+          let wantExit = false;
           try {
             const u = new URL(req.url || "/", "http://127.0.0.1");
             if (u.searchParams.get("exit") === "1" || u.searchParams.get("exitProcess") === "1") {
-              exitProcess = true;
+              wantExit = true;
             }
           } catch { /* ignore */ }
           try {
             if (body) {
               const parsed = JSON.parse(body);
               if (parsed?.reason) reason = String(parsed.reason);
-              if (parsed?.exitProcess === true || parsed?.exit === true) exitProcess = true;
+              if (parsed?.exitProcess === true || parsed?.exit === true) wantExit = true;
             }
           } catch { /* ignore */ }
 
           const uptime = serverStartedAt ? Date.now() - serverStartedAt : 0;
-          if (exitProcess && uptime < EXIT_GRACE_MS) {
+          // Hard block: process.exit only with explicit settings AND after grace
+          const exitProcess =
+            wantExit && TAU_EXIT_ON_BROWSER_CLOSE && uptime >= EXIT_GRACE_MS;
+
+          if (wantExit && !TAU_EXIT_ON_BROWSER_CLOSE) {
             console.log(
-              `[Mirror] Ignoring process exit during startup grace (${uptime}ms < ${EXIT_GRACE_MS}ms, reason=${reason})`
+              `[Mirror] Browser asked to exit Pi (reason=${reason}) — ignored. Set tau.exitOnBrowserClose=true to enable.`
             );
-            exitProcess = false;
+          } else if (wantExit && uptime < EXIT_GRACE_MS) {
+            console.log(
+              `[Mirror] Ignoring exit during startup grace (${uptime}ms < ${EXIT_GRACE_MS}ms)`
+            );
           }
 
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({
             ok: true,
-            stoppingServer: !exitProcess,
+            ignored: !exitProcess && uptime < EXIT_GRACE_MS,
             exitProcess,
             reason,
-            graceBlocked: uptime < EXIT_GRACE_MS && reason === "web_ui_closed",
+            exitOnBrowserClose: TAU_EXIT_ON_BROWSER_CLOSE,
           }));
 
           setTimeout(() => {
+            const live = [...clients].filter((c) => c.readyState === WebSocket.OPEN).length;
             if (exitProcess) {
-              // Another tab may still be connected (or reconnecting after auto-open)
-              const live = [...clients].filter((c) => c.readyState === WebSocket.OPEN).length;
               if (live > 0) {
-                console.log(`[Mirror] ${live} browser client(s) still connected — not exiting Pi`);
+                console.log(`[Mirror] ${live} client(s) still connected — not exiting Pi`);
                 return;
               }
               quitPiProcess(reason);
-            } else {
-              // Do NOT stopServer on spurious early beacons — that kills the new UI mid-load
-              if (uptime < EXIT_GRACE_MS) {
-                console.log(`[Mirror] Ignoring stopServer during startup grace (reason=${reason})`);
-                return;
-              }
-              try {
-                stopServer();
-                console.log(`[Mirror] Server stopped (reason: ${reason})`);
-              } catch (e) {
-                console.warn("[Mirror] stopServer failed:", e);
-              }
+              return;
+            }
+            // Do not stopServer on tab close by default — port stays up for reconnect.
+            // Only /taustop or explicit exit stops the mirror.
+            if (uptime < EXIT_GRACE_MS) {
+              console.log(`[Mirror] Shutdown beacon ignored during grace (reason=${reason})`);
             }
           }, 250);
         });
@@ -2611,5 +2620,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     }, 200);
   }
 
-  console.log("[Mirror] Tau extension loaded (prompt/new-session safe, exit on browser close)");
+  console.log(
+    `[Mirror] Tau extension loaded (exitOnBrowserClose=${TAU_EXIT_ON_BROWSER_CLOSE}, grace=${EXIT_GRACE_MS}ms)`
+  );
 }
