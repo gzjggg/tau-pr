@@ -13,7 +13,7 @@
  *
  * NEVER call process.exit from this file — browser close must not kill Pi.
  */
-const TAU_BUILD_ID = "tau-2026-07-14-fix-kill0-v5";
+const TAU_BUILD_ID = "tau-2026-07-14-fix-broadcast-v6";
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { WebSocketServer, WebSocket } from "ws";
@@ -513,13 +513,84 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════
   // Helper: broadcast to all clients
   // ═══════════════════════════════════════
-  function broadcast(data: any) {
-    const json = JSON.stringify(data);
-    for (const client of clients) {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(json);
+  function safeStringify(data: any): string | null {
+    try {
+      return JSON.stringify(data);
+    } catch {
+      // Agent message objects can occasionally contain cycles / BigInt
+      try {
+        const seen = new WeakSet();
+        return JSON.stringify(data, (_k, v) => {
+          if (typeof v === "bigint") return v.toString();
+          if (typeof v === "object" && v !== null) {
+            if (seen.has(v)) return undefined;
+            seen.add(v);
+          }
+          return v;
+        });
+      } catch (e2) {
+        console.warn("[Mirror] broadcast JSON failed:", e2);
+        return null;
       }
     }
+  }
+
+  function broadcast(data: any) {
+    const json = safeStringify(data);
+    if (!json) return;
+    let sent = 0;
+    for (const client of clients) {
+      if (client.readyState === WebSocket.OPEN) {
+        try {
+          client.send(json);
+          sent++;
+        } catch (e) {
+          console.warn("[Mirror] client.send failed:", e);
+        }
+      }
+    }
+    if (sent === 0 && clients.size > 0) {
+      // clients exist but none OPEN — useful debug
+    }
+  }
+
+  /** Slim event payload for high-frequency streaming (avoids huge/circular message blobs) */
+  function eventPayloadForBrowser(eventType: string, event: any): any {
+    if (!event || typeof event !== "object") return { type: eventType };
+    // message_update: only need deltas for live UI
+    if (eventType === "message_update") {
+      return {
+        type: "message_update",
+        assistantMessageEvent: event.assistantMessageEvent,
+        // include message role only (full message is huge / can fail to stringify)
+        message: event.message
+          ? { role: event.message.role, id: event.message.id }
+          : undefined,
+      };
+    }
+    if (eventType === "message_start" || eventType === "message_end") {
+      return {
+        type: eventType,
+        message: event.message,
+      };
+    }
+    if (
+      eventType === "tool_execution_start" ||
+      eventType === "tool_execution_update" ||
+      eventType === "tool_execution_end"
+    ) {
+      return {
+        type: eventType,
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        args: event.args,
+        partialResult: event.partialResult,
+        result: event.result,
+        isError: event.isError,
+      };
+    }
+    // Default: shallow copy + force type
+    return { ...event, type: eventType };
   }
 
   let mirrorUrl = "";
@@ -640,12 +711,8 @@ export default function (pi: ExtensionAPI) {
         /* stale ctx after switch — ignore */
       }
 
-      // Forward to browsers. Put eventType last so nested event.type cannot overwrite.
       try {
-        const payload =
-          event && typeof event === "object"
-            ? { ...event, type: eventType }
-            : { type: eventType };
+        const payload = eventPayloadForBrowser(eventType, event);
         broadcast({ type: "event", event: payload });
       } catch (e) {
         console.warn(`[Mirror] broadcast ${eventType} failed:`, e);

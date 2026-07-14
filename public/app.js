@@ -403,14 +403,26 @@ function getMessageText(message) {
 
 function handleMessageUpdate(event) {
   const { assistantMessageEvent } = event;
+  if (!assistantMessageEvent) return;
+
+  // If message_start was lost/dropped, still create a streaming bubble
+  if (!currentStreamingElement && (assistantMessageEvent.type === 'text_delta' || assistantMessageEvent.type === 'thinking_delta')) {
+    currentStreamingText = currentStreamingText || '';
+    currentStreamingThinking = currentStreamingThinking || '';
+    currentStreamingElement = messageRenderer.renderAssistantMessage(
+      { content: '' },
+      true
+    );
+    showTypingIndicator(false);
+  }
 
   if (assistantMessageEvent.type === 'thinking_delta') {
-    currentStreamingThinking += assistantMessageEvent.delta;
+    currentStreamingThinking += assistantMessageEvent.delta || '';
     if (currentStreamingElement) {
       messageRenderer.updateStreamingThinking(currentStreamingElement, currentStreamingThinking);
     }
   } else if (assistantMessageEvent.type === 'text_delta') {
-    currentStreamingText += assistantMessageEvent.delta;
+    currentStreamingText += assistantMessageEvent.delta || '';
     if (currentStreamingElement) {
       messageRenderer.updateStreamingMessage(
         currentStreamingElement,
