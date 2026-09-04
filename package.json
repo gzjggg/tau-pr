@@ -1,6 +1,6 @@
 {
   "name": "tau-mirror",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "description": "Web UI that mirrors your Pi terminal session in the browser",
   "keywords": [
     "pi",
