@@ -4,8 +4,6 @@
 
 A web UI that mirrors your [Pi](https://github.com/badlogic/pi-mono) terminal session in the browser. No separate server — it runs as a Pi extension inside your existing process.
 
-This repository is a maintained fork of [deflating/tau](https://github.com/deflating/tau) with a command system, Hephaestus-style session cover, session switching, and UI polish.
-
 ![Tau dark mode](docs/images/dark.png)
 
 ![Tau terracotta theme](docs/images/terracotta.png)
@@ -23,45 +21,32 @@ Tau connects to your running Pi TUI and gives you a second view in the browser. 
 - **Session browser** — view history from any past session; switch the live Pi session from the sidebar
 - **No extra process** — the Pi extension *is* the server
 - **Command system** — slash completion, Command Center, and Pi command dispatch
-- **Session cover** — Hephaestus-inspired prologue at the top of each session (UI-only, not written to history)
+- **Session cover** — session prologue at the top of each session (UI-only, not written to history)
 
 ## Install
 
-### From this fork (path package)
+```bash
+pi install npm:tau-mirror
+```
 
-Point Pi at a local clone (recommended for development and this fork):
+Or from git:
+
+```bash
+pi install git:github.com/deflating/tau
+```
+
+For development, point Pi at a local clone via `~/.pi/agent/settings.json`:
 
 ```json
-// ~/.pi/agent/settings.json
 {
   "packages": [
-    "C:/path/to/tau"
+    "/absolute/path/to/tau"
   ],
   "tau": {
     "port": 38471,
     "autoOpenBrowser": true
   }
 }
-```
-
-Or on macOS/Linux:
-
-```json
-{
-  "packages": [
-    "/absolute/path/to/tau"
-  ]
-}
-```
-
-### From npm / git
-
-```bash
-# Upstream package (if published)
-pi install npm:tau-mirror
-
-# This fork
-pi install git:github.com/gzjggg/tau
 ```
 
 ## Usage
@@ -76,10 +61,10 @@ pi install git:github.com/gzjggg/tau
 | `/qr` | Show a phone QR code |
 | `/tau-start` / `/tau-stop` | Start or stop the mirror server |
 | `/tau-switch` | Arm the session-switch hook (run once if sidebar switch fails) |
-| Close the Tau browser tab | Shuts down the Tau port and exits Pi (sendBeacon) |
+| Close the Tau browser tab | Stops nothing by default — Pi keeps running; set `exitOnBrowserClose: true` to opt in to shutdown |
 | `TAU_AUTO_OPEN=0` | Disable auto-open browser |
 
-## Fork highlights
+## Highlights
 
 ### Slash commands & Command Center
 
@@ -89,7 +74,7 @@ pi install git:github.com/gzjggg/tau
 
 ### Session cover
 
-A short Hephaestus-inspired cover appears at the top of each session (project, model, time). It is display-only and is not stored in session history.
+A short cover appears at the top of each session (project, model, runtime). It is display-only and is not stored in session history.
 
 ### Session switch
 
@@ -98,7 +83,6 @@ Click a session in the sidebar to switch the live Pi TUI session via `switchSess
 ### UI
 
 - Larger base fonts and stronger accent colors
-- Pixel brand mark 
 - Light-theme link / skill styling improvements
 - Dual-color slash input (transparent textarea + mirror under a solid bubble)
 
@@ -209,12 +193,12 @@ Tau is a [Pi extension](https://github.com/badlogic/pi-mono#extensions) that sta
                     └──────────────────────────────┘
 ```
 
-No separate server process. The extension auto-loads with Pi and shuts down when Pi exits (or when the browser tab requests shutdown).
+No separate server process. The extension auto-loads with Pi and shuts down when Pi exits.
 
 ## Development
 
 ```bash
-git clone https://github.com/gzjggg/tau.git
+git clone https://github.com/deflating/tau.git
 cd tau
 # Point packages[] or TAU_STATIC_DIR at this tree
 TAU_STATIC_DIR=$(pwd)/public pi   # Unix
@@ -229,10 +213,6 @@ Edit files under `public/` and refresh the browser. After changes to `extensions
 Remove-Item "$env:LOCALAPPDATA\Temp\jiti" -Recurse -Force -ErrorAction SilentlyContinue
 ```
 
-## Credits
-
-- Upstream: [deflating/tau](https://github.com/deflating/tau)
-- Pi: [badlogic/pi-mono](https://github.com/badlogic/pi-mono)
 
 ## License
 

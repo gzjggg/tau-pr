@@ -4,8 +4,6 @@
 
 在浏览器中镜像 [Pi](https://github.com/badlogic/pi-mono) 终端会话的 Web UI。无需独立服务进程——作为 Pi 扩展运行在现有进程内。
 
-本仓库为 [deflating/tau](https://github.com/deflating/tau) 的维护分支，增加了命令系统、Hephaestus 风格会话封面、侧栏会话切换与 UI 打磨。
-
 ![Tau 深色模式](docs/images/dark.png)
 
 ![Tau 陶土主题](docs/images/terracotta.png)
@@ -23,45 +21,32 @@ Tau 接入正在运行的 Pi TUI，在浏览器中提供同一会话的第二视
 - **会话浏览** — 查看历史会话；侧栏可切换当前 Pi 会话
 - **无额外进程** — 扩展本身即是服务器
 - **命令系统** — 斜杠补全、命令中心、Pi 命令派发
-- **会话封面** — 类 Hephaestus 的会话开场（仅 UI，不写入历史）
+- **会话封面** — 每个会话顶部的开场信息（仅 UI，不写入历史）
 
 ## 安装
 
-### 本分支（路径包，推荐）
+```bash
+pi install npm:tau-mirror
+```
 
-在 Pi 配置中指向本地克隆目录：
+或从 git 安装：
+
+```bash
+pi install git:github.com/deflating/tau
+```
+
+开发时可在 `~/.pi/agent/settings.json` 中指向本地克隆目录：
 
 ```json
-// ~/.pi/agent/settings.json
 {
   "packages": [
-    "C:/path/to/tau"
+    "/absolute/path/to/tau"
   ],
   "tau": {
     "port": 38471,
     "autoOpenBrowser": true
   }
 }
-```
-
-macOS / Linux：
-
-```json
-{
-  "packages": [
-    "/absolute/path/to/tau"
-  ]
-}
-```
-
-### npm / git
-
-```bash
-# 上游包（若已发布）
-pi install npm:tau-mirror
-
-# 本分支
-pi install git:github.com/gzjggg/tau
 ```
 
 ## 使用
@@ -76,10 +61,10 @@ pi install git:github.com/gzjggg/tau
 | `/qr` | 显示手机扫码二维码 |
 | `/tau-start` / `/tau-stop` | 启动 / 停止镜像服务 |
 | `/tau-switch` | 挂载会话切换钩子（侧栏切换失败时在终端执行一次） |
-| 关闭 Tau 浏览器标签 | 关闭 Tau 端口并退出 Pi（sendBeacon） |
+| 关闭 Tau 浏览器标签 | 默认不影响 Pi；如需联动退出，设置 `exitOnBrowserClose: true` |
 | `TAU_AUTO_OPEN=0` | 禁用自动打开浏览器 |
 
-## 本分支亮点
+## 亮点
 
 ### 斜杠命令与命令中心
 
@@ -89,7 +74,7 @@ pi install git:github.com/gzjggg/tau
 
 ### 会话封面
 
-每个会话顶部展示简短的 Hephaestus 风格封面（项目、模型、时间等），仅展示，不写入会话历史。
+每个会话顶部展示简短的封面（项目、模型、运行时等），仅展示，不写入会话历史。
 
 ### 会话切换
 
@@ -98,7 +83,7 @@ pi install git:github.com/gzjggg/tau
 ### UI
 
 - 更大字号与更强强调色  
-- 像素品牌标 
+- 会话封面像素 π 标
 - 浅色主题链接 / 技能样式优化  
 - 斜杠输入双色显示（透明 textarea + 底层镜像 + 实色气泡）  
 
@@ -209,12 +194,12 @@ Tau 是 [Pi 扩展](https://github.com/badlogic/pi-mono#extensions)，在 Pi 进
                     └──────────────────────────────┘
 ```
 
-无需独立服务。扩展随 Pi 加载，Pi 退出或浏览器请求关闭时一并关闭。
+无需独立服务。扩展随 Pi 加载，Pi 退出时一并关闭。
 
 ## 开发
 
 ```bash
-git clone https://github.com/gzjggg/tau.git
+git clone https://github.com/deflating/tau.git
 cd tau
 # 用 packages[] 或 TAU_STATIC_DIR 指向本仓库
 TAU_STATIC_DIR=$(pwd)/public pi   # Unix
@@ -229,10 +214,6 @@ TAU_STATIC_DIR=$(pwd)/public pi   # Unix
 Remove-Item "$env:LOCALAPPDATA\Temp\jiti" -Recurse -Force -ErrorAction SilentlyContinue
 ```
 
-## 致谢
-
-- 上游：[deflating/tau](https://github.com/deflating/tau)  
-- Pi：[badlogic/pi-mono](https://github.com/badlogic/pi-mono)  
 
 ## 许可证
 

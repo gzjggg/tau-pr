@@ -2,13 +2,12 @@
 
 ## Package identity
 
-Repo: **tau** (fork) | npm package: **tau-mirror**  
-GitHub: https://github.com/gzjggg/tau  
-Upstream: https://github.com/deflating/tau
+Repo: **tau** | npm package: **tau-mirror**  
+GitHub: https://github.com/deflating/tau
 
 Production install (OS-independent):
 ```
-npm install -g git+https://github.com/gzjggg/tau.git#main
+npm install -g git+https://github.com/deflating/tau.git#main
 ```
 
 Or via Pi packages path (recommended for local dev):

@@ -57,9 +57,9 @@ function piMarkSvg() {
     <svg class="session-cover__pi" viewBox="0 0 ${w} ${vh}" width="48" height="80" aria-hidden="true" shape-rendering="crispEdges" preserveAspectRatio="xMidYMid meet">
       <defs>
         <linearGradient id="${uid}" x1="0" y1="0" x2="${w}" y2="${vh}" gradientUnits="userSpaceOnUse">
-          <stop offset="0%" stop-color="#f0abfc"/>
-          <stop offset="40%" stop-color="#a78bfa"/>
-          <stop offset="100%" stop-color="#22d3ee"/>
+          <stop offset="0%" style="stop-color:var(--sc-pi-1)"/>
+          <stop offset="45%" style="stop-color:var(--sc-pi-2)"/>
+          <stop offset="100%" style="stop-color:var(--sc-pi-3)"/>
         </linearGradient>
       </defs>
       ${rects}
