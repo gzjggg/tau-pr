@@ -991,10 +991,20 @@ export default function (pi: ExtensionAPI) {
   // Build state snapshot for new connections
   // ═══════════════════════════════════════
   async function buildStateSnapshot(ctx: ExtensionContext) {
-    const entries = ctx.sessionManager.getEntries();
-    const model = ctx.model;
-    const sessionFile = ctx.sessionManager.getSessionFile();
-    const contextUsage = ctx.getContextUsage();
+    // sessionManager only exists in interactive (TUI) sessions; in print/rpc
+    // mode the getter throws, crashing the process on browser connect.
+    let entries: ReturnType<ExtensionContext["sessionManager"]["getEntries"]> = [];
+    let sessionFile: string | undefined;
+    try {
+      entries = ctx.sessionManager.getEntries();
+      sessionFile = ctx.sessionManager.getSessionFile();
+    } catch { /* non-interactive mode */ }
+    // All ctx property access below can throw on a stale ctx (post-switch/reload)
+    // or in non-interactive mode — guard each so a browser connect never crashes Pi.
+    let model: ExtensionContext["model"] | undefined;
+    try { model = ctx.model; } catch { /* stale ctx */ }
+    let contextUsage: ReturnType<ExtensionContext["getContextUsage"]> | undefined;
+    try { contextUsage = ctx.getContextUsage(); } catch { /* stale ctx */ }
 
     // Prefer live API (survives session switch); fall back to factory pi
     let thinkingLevel: string | undefined;
@@ -1020,7 +1030,8 @@ export default function (pi: ExtensionAPI) {
       adapterInfo = listed.adapter;
     } catch { /* ignore */ }
 
-    const sessionCover = await buildSessionCover(ctx);
+    let sessionCover: Awaited<ReturnType<typeof buildSessionCover>> | undefined;
+    try { sessionCover = await buildSessionCover(ctx); } catch { sessionCover = undefined; }
 
     let isStreaming = false;
     try { isStreaming = !ctx.isIdle(); } catch { isStreaming = false; }
@@ -1032,7 +1043,7 @@ export default function (pi: ExtensionAPI) {
       thinkingLevel,
       sessionName,
       sessionFile,
-      cwd: sessionCover?.cwd || (ctx as any)?.cwd || process.cwd(),
+      cwd: sessionCover?.cwd || process.cwd(),
       isStreaming,
       contextUsage,
       commands,
